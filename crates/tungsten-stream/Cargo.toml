@@ -1,0 +1,11 @@
+[package]
+name = "tungsten-stream"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+
+[dependencies]
+tungsten-core.workspace = true
+glam.workspace = true
+crossbeam-channel.workspace = true

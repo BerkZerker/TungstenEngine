@@ -1,0 +1,19 @@
+[package]
+name = "tungsten-game"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license-file.workspace = true
+
+[[bin]]
+name = "tungsten"
+path = "src/main.rs"
+
+[dependencies]
+tungsten-core.workspace = true
+tungsten-stream.workspace = true
+tungsten-render.workspace = true
+glam.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+pollster.workspace = true
