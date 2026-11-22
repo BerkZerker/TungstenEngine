@@ -8,6 +8,7 @@ use tungsten_core::field::LocalField;
 use tungsten_core::hash::{IntMap, IntSet};
 use tungsten_core::log::{self, Baked, CellEdits, CellPos, CellSet, EditLog, TIERS};
 use tungsten_core::mesh::{ChunkMesh, mesh_block};
+use tungsten_core::water;
 use tungsten_core::worldgen::{Generated, Generator};
 use tungsten_core::{Chunk, ChunkPos, Volume, WorldParams};
 
@@ -215,10 +216,11 @@ impl World {
                     let untouched = |s| matches!(generated, Generated::Uniform(u) if u == s) && cells.is_empty();
                     // Coarse nodes overlap their neighbours; see `mesh_block`.
                     let margin = (key.level > 0) as i32;
-                    let mesh = match generated {
+                    let mut mesh = match generated {
                         Generated::Uniform(_) if cells.is_empty() => ChunkMesh::default(),
                         _ => mesh_block(&block, margin),
                     };
+                    mesh.water = water::node_patches(&worker_gen, key);
                     let chunk = (key.level == 0).then(|| match generated {
                         Generated::Uniform(s) if untouched(s) => Chunk::Uniform(s),
                         _ => block.interior(),
@@ -229,7 +231,9 @@ impl World {
                     // Copying 27 chunks into a block is the expensive part of
                     // starting a mesh, so it happens here, not on the main thread.
                     let block = LocalField::gather(key, &chunks);
-                    Done::Node { key, version, group, mesh: mesh_block(&block, 0), chunk: None }
+                    let mut mesh = mesh_block(&block, 0);
+                    mesh.water = water::node_patches(&worker_gen, key);
+                    Done::Node { key, version, group, mesh, chunk: None }
                 }
                 Job::Bake { cell, edits } => {
                     Done::Baked { cell, ops: edits.ops.len(), baked: log::bake(&worker_gen, &rules, cell, &edits) }

@@ -12,6 +12,8 @@ struct Globals {
     // x: fog start distance, y: fog end distance.
     fog: vec4<f32>,
     materials: array<vec4<f32>, 4>,
+    // Used by water.wgsl.
+    water: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> g: Globals;

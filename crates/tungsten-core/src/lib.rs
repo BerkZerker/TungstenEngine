@@ -16,6 +16,7 @@ pub mod material;
 pub mod mesh;
 pub mod noise;
 pub mod raycast;
+pub mod water;
 pub mod worldgen;
 
 pub use chunk::{Chunk, Dense, Sample, Volume};

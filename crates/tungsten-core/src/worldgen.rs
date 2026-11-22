@@ -39,6 +39,8 @@ pub const SAND_LINE: f32 = 0.0;
 pub const STONE_LINE: f32 = 40.0;
 /// How far the two lines wander up and down, metres.
 const LINE_WOBBLE: f32 = 3.0;
+/// Height of the sea, metres: open ground below it is under water.
+pub const SEA_LEVEL: f32 = SAND_LINE;
 
 /// Largest cave radius in noise units; see `cave_radius`.
 const CAVE_R_MAX: f32 = 0.09;
@@ -82,6 +84,24 @@ struct Column {
     max_cliff: f32,
     min_inv_grad: f32,
     min_open: f32,
+}
+
+/// Base terrain heights of one column of nodes, shared with whoever needs
+/// the ground without generating a block (water).
+#[derive(Clone)]
+pub struct Heights(Arc<Column>);
+
+impl Heights {
+    /// Height in metres at a node-local sample, from `-APRON` to `CHUNK_SIZE + APRON - 1`.
+    #[inline]
+    pub fn at(&self, x: i32, z: i32) -> f32 {
+        self.0.height[(z + APRON) as usize * P + (x + APRON) as usize]
+    }
+
+    /// Lowest height in the column, apron included.
+    pub fn min(&self) -> f32 {
+        self.0.min_h
+    }
 }
 
 /// What a generated block turned out to be.
@@ -179,6 +199,11 @@ impl Generator {
     /// Heights the terrain surface can reach, metres: lowest valley floor to highest peak.
     pub fn height_range(&self) -> (f32, f32) {
         (-60.0, 60.0 + MOUNTAIN_HEIGHT)
+    }
+
+    /// Base terrain heights under the nodes at `(cx, cz)` of `level`.
+    pub fn heights(&self, level: u8, cx: i32, cz: i32) -> Heights {
+        Heights(self.column(level, cx, cz))
     }
 
     fn column(&self, level: u8, cx: i32, cz: i32) -> Arc<Column> {

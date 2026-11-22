@@ -98,7 +98,9 @@ pub fn run(args: Args) -> Result<(), String> {
             },
         );
         let t = Instant::now();
-        stats = renderer.render(&gpu, &view, &game.camera(), &sky, &lines, &text);
+        // Ripples are placed by simulation time, so a capture is repeatable.
+        let time = game.tick as f32 * crate::player::TICK as f32;
+        stats = renderer.render(&gpu, &view, &game.camera(), &sky, &lines, &text, time);
         gpu.device.poll(wgpu::PollType::wait_indefinitely()).map_err(|e| e.to_string())?;
         frame_time = t.elapsed().as_secs_f32();
     }

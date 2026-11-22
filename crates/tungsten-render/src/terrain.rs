@@ -18,6 +18,7 @@ pub(crate) struct Globals {
     pub fog_color: [f32; 4],
     pub fog: [f32; 4],
     pub materials: [[f32; 4]; 4],
+    pub water: [f32; 4],
 }
 
 struct ChunkGpu {
@@ -53,12 +54,12 @@ pub(crate) struct Terrain {
 }
 
 /// Frustum planes (left, right, bottom, top, near) of a reverse-Z clip matrix.
-fn frustum_planes(m: &Mat4) -> [Vec4; 5] {
+pub(crate) fn frustum_planes(m: &Mat4) -> [Vec4; 5] {
     let (r0, r1, r2, r3) = (m.row(0), m.row(1), m.row(2), m.row(3));
     [r3 + r0, r3 - r0, r3 + r1, r3 - r1, r3 - r2]
 }
 
-fn aabb_visible(planes: &[Vec4; 5], min: Vec3, max: Vec3) -> bool {
+pub(crate) fn aabb_visible(planes: &[Vec4; 5], min: Vec3, max: Vec3) -> bool {
     let (c, e) = ((min + max) * 0.5, (max - min) * 0.5);
     planes.iter().all(|p| {
         let n = p.truncate();
@@ -174,6 +175,16 @@ impl Terrain {
         })
     }
 
+    /// The uniform buffer every world-space shader reads.
+    pub fn globals(&self) -> &wgpu::Buffer {
+        &self.globals
+    }
+
+    /// Nodes that are to be drawn.
+    pub fn shown(&self) -> &IntSet<NodeKey> {
+        &self.shown
+    }
+
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
     }
@@ -187,7 +198,7 @@ impl Terrain {
 
     pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, key: NodeKey, mesh: &ChunkMesh) {
         self.remove(key);
-        if mesh.is_empty() {
+        if mesh.indices.is_empty() {
             return;
         }
         debug_assert!(mesh.indices.len().is_multiple_of(2));

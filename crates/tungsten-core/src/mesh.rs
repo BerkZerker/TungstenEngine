@@ -7,6 +7,7 @@ pub use crate::coords::APRON;
 use crate::coords::{self, CHUNK_SIZE, SOLID};
 use crate::field::LocalField;
 use crate::material;
+use crate::water::WaterPatch;
 
 const N: i32 = CHUNK_SIZE;
 const PAD: usize = coords::PAD as usize;
@@ -38,6 +39,8 @@ pub struct MeshVertex {
 pub struct ChunkMesh {
     pub vertices: Vec<MeshVertex>,
     pub indices: Vec<u16>,
+    /// Water surfaces drawn with the node; see `water.rs`.
+    pub water: Vec<WaterPatch>,
 }
 
 impl MeshVertex {
@@ -49,7 +52,7 @@ impl MeshVertex {
 
 impl ChunkMesh {
     pub fn is_empty(&self) -> bool {
-        self.indices.is_empty()
+        self.indices.is_empty() && self.water.is_empty()
     }
 }
 

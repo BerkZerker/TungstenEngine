@@ -192,7 +192,8 @@ impl Running {
         let sky = Sky::daylight(self.game.view_distance());
         let camera = self.game.camera();
         hud::brush_outline(&mut self.lines, &self.game, &camera);
-        self.last_stats = self.renderer.render(&self.gpu, &view, &camera, &sky, &self.lines, &self.text);
+        let time = self.started.elapsed().as_secs_f32();
+        self.last_stats = self.renderer.render(&self.gpu, &view, &camera, &sky, &self.lines, &self.text, time);
         self.window.pre_present_notify();
         self.gpu.queue.present(frame);
     }

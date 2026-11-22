@@ -1,16 +1,20 @@
 use glam::{IVec3, Vec3};
 use tungsten_core::material::MATERIALS;
 use tungsten_core::mesh::ChunkMesh;
+use tungsten_core::water::BodyId;
 use tungsten_core::{NodeKey, WorldParams};
 
 use crate::gpu::Gpu;
 use crate::lines::{LineBatch, LinePipeline};
 use crate::terrain::{Globals, Terrain};
 use crate::text::{TextBatch, TextPipeline};
+use crate::water::Water;
 
 pub(crate) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const SAMPLES: u32 = 4;
 const Z_NEAR: f32 = 0.08;
+/// Must match `PERIOD` in water.wgsl.
+const RIPPLE_PERIOD: f64 = 64.0;
 
 /// Where the frame is seen from. Position is split into a finest-level chunk
 /// and an offset inside it so rendering stays precise at any distance from
@@ -78,6 +82,7 @@ pub struct Renderer {
     msaa: wgpu::TextureView,
     depth: wgpu::TextureView,
     terrain: Terrain,
+    water: Water,
     lines: LinePipeline,
     text: TextPipeline,
 }
@@ -100,13 +105,15 @@ fn attachment(device: &wgpu::Device, label: &str, format: wgpu::TextureFormat, s
 impl Renderer {
     pub fn new(gpu: &Gpu, format: wgpu::TextureFormat, width: u32, height: u32, params: WorldParams) -> Self {
         let size = (width.max(1), height.max(1));
+        let terrain = Terrain::new(&gpu.device, format, SAMPLES);
         Self {
             format,
             size,
             params,
             msaa: attachment(&gpu.device, "msaa color", format, size),
             depth: attachment(&gpu.device, "depth", DEPTH_FORMAT, size),
-            terrain: Terrain::new(&gpu.device, format, SAMPLES),
+            water: Water::new(&gpu.device, format, SAMPLES, terrain.globals()),
+            terrain,
             lines: LinePipeline::new(&gpu.device, format, SAMPLES),
             text: TextPipeline::new(&gpu.device, format, SAMPLES),
         }
@@ -127,10 +134,18 @@ impl Renderer {
 
     pub fn upload_node(&mut self, gpu: &Gpu, key: NodeKey, mesh: &ChunkMesh) {
         self.terrain.upload(&gpu.device, &gpu.queue, key, mesh);
+        self.water.upload(&gpu.device, &gpu.queue, key, &mesh.water);
     }
 
     pub fn remove_node(&mut self, key: NodeKey) {
         self.terrain.remove(key);
+        self.water.remove(key);
+    }
+
+    /// Surface levels, in fixed-point base cells, of the water bodies that
+    /// have moved since their nodes were meshed.
+    pub fn set_water_levels(&mut self, levels: impl IntoIterator<Item = (BodyId, i64)>) {
+        self.water.set_levels(levels);
     }
 
     /// Change which nodes are drawn. A node is hidden until shown.
@@ -138,7 +153,9 @@ impl Renderer {
         self.terrain.set_visible(show, hide);
     }
 
-    /// Draw one frame into `target`, which must have this renderer's format and size.
+    /// Draw one frame into `target`, which must have this renderer's format
+    /// and size. `time` is in seconds and only moves the ripples on water.
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         gpu: &Gpu,
@@ -147,6 +164,7 @@ impl Renderer {
         sky: &Sky,
         lines: &LineBatch,
         text: &TextBatch,
+        time: f32,
     ) -> FrameStats {
         let aspect = self.size.0 as f32 / self.size.1 as f32;
         let proj = glam::camera::rh::proj::directx::perspective_infinite_reverse(camera.fov_y, aspect, Z_NEAR);
@@ -167,6 +185,12 @@ impl Renderer {
                 let c = MATERIALS[i].color;
                 [c[0], c[1], c[2], 1.0]
             }),
+            water: {
+                // Where the camera chunk sits in the ripple pattern, which
+                // repeats every `RIPPLE_PERIOD` metres.
+                let at = |c: i32| (c as f64 * self.params.chunk_metres() as f64).rem_euclid(RIPPLE_PERIOD) as f32;
+                [at(camera.chunk.x), at(camera.chunk.z), time, 0.0]
+            },
         };
         let (draws, triangles) = self.terrain.prepare(
             &gpu.device,
@@ -176,6 +200,15 @@ impl Renderer {
             camera.chunk,
             camera.local,
             self.params.cell_size,
+        );
+        let (water_draws, water_triangles) = self.water.prepare(
+            &gpu.device,
+            &gpu.queue,
+            &view_proj,
+            camera.chunk,
+            camera.local,
+            self.params.cell_size,
+            self.terrain.shown(),
         );
         let line_vertices = self.lines.prepare(&gpu.device, &gpu.queue, &view_proj, lines);
         let glyphs = self.text.prepare(&gpu.device, &gpu.queue, self.size, text);
@@ -208,12 +241,19 @@ impl Renderer {
                 multiview_mask: None,
             });
             self.terrain.draw(&mut pass);
+            self.water.draw(&mut pass);
             self.lines.draw(&mut pass, line_vertices);
             self.text.draw(&mut pass, glyphs);
         }
         gpu.queue.submit([encoder.finish()]);
 
         let (gpu_bytes_used, gpu_bytes_reserved) = self.terrain.memory();
-        FrameStats { draws, triangles, chunks: self.terrain.chunk_count() as u32, gpu_bytes_used, gpu_bytes_reserved }
+        FrameStats {
+            draws: draws + water_draws,
+            triangles: triangles + water_triangles,
+            chunks: self.terrain.chunk_count() as u32,
+            gpu_bytes_used,
+            gpu_bytes_reserved,
+        }
     }
 }

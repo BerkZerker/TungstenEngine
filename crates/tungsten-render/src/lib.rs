@@ -7,6 +7,7 @@ mod lines;
 mod renderer;
 mod terrain;
 mod text;
+mod water;
 
 pub use gpu::Gpu;
 pub use lines::LineBatch;
