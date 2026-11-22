@@ -5,7 +5,8 @@ use crate::font;
 #[derive(Clone, Copy, Pod, Zeroable)]
 #[repr(C)]
 struct Glyph {
-    origin: [f32; 3],
+    /// Top-left in pixels, then pixels per font pixel across and down.
+    origin: [f32; 4],
     bits: [u32; 2],
     color: [u8; 4],
 }
@@ -31,6 +32,23 @@ impl TextBatch {
         (font::GLYPH_H + 2) as f32 * scale
     }
 
+    /// Width and height in pixels of `text` at `scale`.
+    pub fn measure(scale: f32, text: &str) -> (f32, f32) {
+        let columns = text.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+        // The last column and line carry no gap after them.
+        let width = columns as f32 * Self::advance(scale) - scale;
+        (width.max(0.0), text.lines().count() as f32 * Self::line_height(scale) - 2.0 * scale)
+    }
+
+    /// Queue a filled rectangle. It is drawn under whatever is queued after it.
+    pub fn rect(&mut self, x: f32, y: f32, width: f32, height: f32, color: [u8; 4]) {
+        self.glyphs.push(Glyph {
+            origin: [x, y, width / font::GLYPH_W as f32, height / font::GLYPH_H as f32],
+            bits: [u32::MAX; 2],
+            color,
+        });
+    }
+
     /// Queue `text` with its top-left at `(x, y)`, with a one-font-pixel drop shadow.
     pub fn push(&mut self, x: f32, y: f32, scale: f32, color: [u8; 4], text: &str) {
         for (pass, color) in [(scale, [0, 0, 0, 200]), (0.0, color)] {
@@ -44,7 +62,7 @@ impl TextBatch {
                 let bits = font::glyph(c);
                 if bits != 0 {
                     self.glyphs.push(Glyph {
-                        origin: [cx + pass, cy + pass, scale],
+                        origin: [cx + pass, cy + pass, scale, scale],
                         bits: [bits as u32, (bits >> 32) as u32],
                         color,
                     });
@@ -108,7 +126,7 @@ impl TextPipeline {
                 buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: size_of::<Glyph>() as u64,
                     step_mode: wgpu::VertexStepMode::Instance,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Uint32x2, 2 => Unorm8x4],
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x4, 1 => Uint32x2, 2 => Unorm8x4],
                 })],
             },
             primitive: wgpu::PrimitiveState::default(),
