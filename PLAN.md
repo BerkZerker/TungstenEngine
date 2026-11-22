@@ -1,8 +1,9 @@
 # Tungsten Engine Plan
 
 Companion to `SPEC.md`. The first section describes the engine as it is now (v0.2),
-the second the first pass at water built on it. Sections 0 to 12 are the v0.1 plan, kept for the mechanics that have not changed
-(materials, meshing rules, the player, rendering, the determinism boundary). Where
+the second the first pass at water built on it. Sections 0 to 12 are the v0.1 plan,
+kept for the mechanics that have not changed (materials, meshing rules, the
+player, rendering, the determinism boundary). Where
 they disagree with the v0.2 section, v0.2 is what is built: in particular 4.1 (cell
 size), 4.2 and 9.3 (chunks and their lifecycle), 7.2 and 7.3 (how brushes are
 applied), 7.5 (sand slump, removed) and 9.6 (saves).
@@ -52,6 +53,11 @@ next. Old worlds are not kept readable.
   generated at levels 0 to 3 only. Where the dirt or sand cover is thinner
   than a coarse cell, the cover material still wins, so bedrock does not show
   through at a distance.
+- **Borders.** Stone meets other materials along the lattice, at a hard edge.
+  Soft materials (dirt, sand) meet along a smooth line: each vertex carries
+  the two materials' shares of the solid samples around it (4 x 4 x 4,
+  weighted 1 3 3 1 per axis), and the shader draws the line where the
+  interpolated shares are equal, one pixel wide. No colour fade.
 - **Mining.** Dirt and sand: every 6 ticks a ball is cut, sunk 0.1 s of the
   material's dig speed (dirt 2.5 m/s, sand 5 m/s) into the surface along its
   normal. Stone: after 0.75 m of work at 1 m/s the shard under the crosshair
@@ -64,7 +70,7 @@ next. Old worlds are not kept readable.
 
 **Verified by running it**
 
-- 45 tests pass; clippy is clean with warnings as errors.
+- 47 tests pass; clippy is clean with warnings as errors.
 - Golden hashes (generated blocks at all six levels near and 500 km from the
   origin, a 120-op editing session, the same session resolved from the log at
   every level, and the encoded log before and after baking) are identical on
@@ -89,7 +95,8 @@ next. Old worlds are not kept readable.
 
 **Known limits**
 
-- Material boundaries are blocky far away: they are hard edges on 4 to 8 m cells.
+- Stone's boundaries are blocky far away: they are hard edges on 4 to 8 m cells.
+- The line between sand and dirt steps slightly where two levels of detail meet.
 - Cave mouths close beyond about 250 m, where level 4 takes over.
 - Collision and raycasts use level-0 samples, loaded within about 16 m of the
   player; flying faster than terrain loads is allowed, walking waits for it.
@@ -157,7 +164,7 @@ and collision do not know it is there.
 
 **Verified by running it**
 
-- 64 tests pass, 19 of them new; clippy is clean with warnings as errors.
+- 66 tests pass, 19 of them for water; clippy is clean with warnings as errors.
 - A scripted session (dig, pour, dig a channel, fill in, pour more, at the
   origin and at a shore, for two sets of world parameters) checks that every
   unit poured is accounted for and pins the encoded state with a golden hash,

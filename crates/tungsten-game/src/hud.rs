@@ -71,11 +71,12 @@ pub fn brush_outline(lines: &mut LineBatch, game: &Game, camera: &Camera) {
 
 pub fn build(text: &mut TextBatch, info: &HudInfo) {
     text.clear();
-    let s = (info.scale * 2.0).round().max(1.0);
+    let s = (info.scale * 3.0).round().max(1.0);
 
     // Crosshair.
+    let c = (info.scale * 2.0).round().max(1.0);
     let (cx, cy) = (info.size.0 as f32 * 0.5, info.size.1 as f32 * 0.5);
-    text.push(cx - 2.5 * s, cy - 3.5 * s, s, [255, 255, 255, 220], "+");
+    text.push(cx - 2.5 * c, cy - 3.5 * c, c, [255, 255, 255, 220], "+");
 
     if !info.show_debug {
         return;
@@ -152,15 +153,14 @@ pub fn build(text: &mut TextBatch, info: &HudInfo) {
     let m3 = |v: i64| v as f64 / 256.0 * (params.cell_size as f64).powi(3);
     let _ = writeln!(
         out,
-        "water   {} ponds {:.1} m3  moving {:.1}  to sea {:.1}  lost {:.1}  sea in {} cells ({} pending)",
+        "water   {} ponds {:.1} m3  moving {:.1}  to sea {:.1}  lost {:.1}",
         w.ponds,
         m3(w.held),
         m3(w.moving),
         m3(w.drained),
-        m3(w.lost),
-        w.sea_cells,
-        w.sea_pending
+        m3(w.lost)
     );
+    let _ = writeln!(out, "sea     in {} cells  {} pending", w.sea_cells, w.sea_pending);
     let _ = writeln!(
         out,
         "draw    {} calls  {:.0}k tris  gpu {:.0}/{:.0} MB",
@@ -181,7 +181,19 @@ pub fn build(text: &mut TextBatch, info: &HudInfo) {
     let _ = write!(out, "{}", info.gpu);
     text.push(6.0 * s, 6.0 * s, s, WHITE, &out);
 
+    // The key list, on as many lines as the window's width needs.
     let help = "WASD move  Space jump  Shift run  Ctrl crouch  LMB break  RMB place  1-3 material  4 water  wheel brush  Space x2 fly  V vsync  F3 debug";
-    let y = info.size.1 as f32 - TextBatch::line_height(s) - 4.0 * s;
-    text.push(6.0 * s, y, s, DIM, help);
+    let columns = ((info.size.0 as f32 - 12.0 * s) / TextBatch::advance(s)) as usize;
+    let mut lines: Vec<String> = Vec::new();
+    for item in help.split("  ") {
+        match lines.last_mut() {
+            Some(line) if line.len() + 2 + item.len() <= columns => {
+                line.push_str("  ");
+                line.push_str(item);
+            }
+            _ => lines.push(item.to_string()),
+        }
+    }
+    let y = info.size.1 as f32 - TextBatch::line_height(s) * lines.len() as f32 - 4.0 * s;
+    text.push(6.0 * s, y, s, DIM, &lines.join("\n"));
 }

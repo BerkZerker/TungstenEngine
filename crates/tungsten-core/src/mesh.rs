@@ -29,8 +29,11 @@ fn pidx(x: i32, y: i32, z: i32) -> usize {
 pub struct MeshVertex {
     /// Chunk-local position: `(cells + APRON) * POS_SCALE`.
     pub pos: [u16; 3],
-    /// Material id in the low byte, sharpness (0..=255) in the high byte.
-    pub mat_sharp: u16,
+    /// Bits 0-3: a material. Bits 4-7: the soft material it borders here, or
+    /// the same one again. Bits 8-15: the second one's share of the surface
+    /// at this vertex; the triangle shows the second where the interpolated
+    /// share passes half. All three vertices of a triangle agree on the pair.
+    pub mats: u16,
     /// Octahedral-encoded unit normal.
     pub normal: [i16; 2],
 }
@@ -44,6 +47,11 @@ pub struct ChunkMesh {
 }
 
 impl MeshVertex {
+    /// The pair of materials and the share of the second, 0 to 255.
+    pub fn materials(&self) -> ([u8; 2], u8) {
+        ([self.mats as u8 & 15, self.mats as u8 >> 4], (self.mats >> 8) as u8)
+    }
+
     /// Chunk-local position in cells.
     pub fn cells(&self) -> Vec3 {
         Vec3::new(self.pos[0] as f32, self.pos[1] as f32, self.pos[2] as f32) / POS_SCALE as f32 - APRON as f32
@@ -117,23 +125,25 @@ pub fn surface_point(f: &[u8; 8], mask: u32) -> Vec3 {
     (sum / count * POS_SCALE as f32 + 0.5).floor() / POS_SCALE as f32
 }
 
-/// Material shown at a cell's vertex: that of the solid corner most exposed
-/// to air within the cell, so a thin layer shows as itself rather than as
-/// whatever lies beneath it. Ties go to the emptier, then the lower corner.
-#[inline]
-pub fn surface_material(f: &[u8; 8], mask: u32, mat: impl Fn(usize) -> u8) -> u8 {
-    let mut best = (0u32, 0u8, 0usize);
-    for (c, &fill) in f.iter().enumerate() {
-        if mask >> c & 1 == 0 {
-            continue;
-        }
-        // Corners differing in one axis bit are joined by a cell edge.
-        let exposed = (0..3).filter(|a| mask >> (c ^ (1 << a)) & 1 == 0).count() as u32;
-        if exposed > best.0 || (exposed == best.0 && exposed > 0 && fill < best.1) {
-            best = (exposed, fill, c);
+/// How much of each material is solid around a cell: the 4 x 4 x 4 samples
+/// centred on it, weighted 1 3 3 1 along each axis. Where two soft materials
+/// meet, the surface shows whichever has the larger share, and since shares
+/// vary smoothly from vertex to vertex the line between them is a smooth one
+/// instead of following the lattice.
+fn shares(block: &LocalField, base: usize) -> [u16; material::MATERIAL_COUNT] {
+    const K: [u16; 4] = [1, 3, 3, 1];
+    let mut out = [0; material::MATERIAL_COUNT];
+    for (dy, ky) in K.iter().enumerate() {
+        for (dz, kz) in K.iter().enumerate() {
+            let row = base + dy * PAD * PAD + dz * PAD - (PAD * PAD + PAD + 1);
+            for (dx, kx) in K.iter().enumerate() {
+                if block.fill[row + dx] >= SOLID {
+                    out[block.mat[row + dx] as usize % material::MATERIAL_COUNT] += ky * kz * kx;
+                }
+            }
         }
     }
-    mat(best.2)
+    out
 }
 
 /// For each lattice axis: the four cells around an edge along it, as offsets
@@ -170,8 +180,9 @@ pub fn mesh_block(block: &LocalField, margin: i32) -> ChunkMesh {
         return mesh;
     }
     let fill = &block.fill;
-    // Position in cells of each shared vertex.
+    // Position in cells of each shared vertex, and the sample its cell starts at.
     let mut positions: Vec<Vec3> = Vec::new();
+    let mut bases: Vec<u32> = Vec::new();
     let mut cell_vertex = vec![NO_VERTEX; CELLS * CELLS * CELLS];
     // Offsets from a cell's base sample to its eight corners.
     let corner_off: [usize; 8] = std::array::from_fn(|c| {
@@ -214,16 +225,14 @@ pub fn mesh_block(block: &LocalField, margin: i32) -> ChunkMesh {
                 let g = gx0.lerp(gx1, frac.y).lerp(gx2.lerp(gx3, frac.y), frac.z);
                 let normal = if g.length_squared() > 1e-6 { -g.normalize() } else { Vec3::Y };
 
-                let mat = surface_material(&f, mask, |c| block.mat[base + corner_off[c]]);
-                let sharp = (material::def(mat).sharpness * 255.0) as u16;
-
                 cell_vertex[cidx(x, y, z)] = mesh.vertices.len() as u16;
                 mesh.vertices.push(MeshVertex {
                     pos: [raw.x as u16, raw.y as u16, raw.z as u16],
-                    mat_sharp: mat as u16 | sharp << 8,
+                    mats: 0,
                     normal: oct_encode(normal),
                 });
                 positions.push(cell.as_vec3() + frac);
+                bases.push(base as u32);
             }
         }
     }
@@ -232,13 +241,26 @@ pub fn mesh_block(block: &LocalField, margin: i32) -> ChunkMesh {
     // owned by the chunk holding its lower sample; a margin adds the edges of
     // one more layer of samples all round.
     //
-    // A quad is the face of the solid sample on its edge and takes that
-    // sample's material whole, so materials meet at a hard line. A shared
-    // vertex of another material is copied for it, once per material.
+    // A quad is the face of the solid sample on its edge and has that
+    // sample's material. Against a faceted material that is the whole story:
+    // the two meet at a hard line along the lattice. Where two soft materials
+    // meet, the triangles near the line carry both and each vertex's shares,
+    // and the line is drawn where the shares are equal. A shared vertex is
+    // copied once for each pair of materials it is used with.
     //
     // Triangles of faceted materials get three vertices of their own carrying
     // the face normal, so they shade flat with no per-pixel derivatives.
-    let mut variants = vec![[NO_VERTEX; 4]; mesh.vertices.len()];
+    const NO_SHARES: [u16; material::MATERIAL_COUNT] = [u16::MAX; material::MATERIAL_COUNT];
+    let is_soft = |m: usize| m != 0 && material::MATERIALS[m].sharpness < 0.5;
+    // Most blocks hold one soft material and have no such line to find.
+    let mut present = [false; material::MATERIAL_COUNT];
+    for &m in &block.mat {
+        present[m as usize % material::MATERIAL_COUNT] = true;
+    }
+    let borders = (0..material::MATERIAL_COUNT).filter(|&m| present[m] && is_soft(m)).count() > 1;
+    let mut vertex_shares = vec![NO_SHARES; if borders { mesh.vertices.len() } else { 0 }];
+    let mut variants = vec![[NO_VERTEX; 16]; mesh.vertices.len()];
+    let mut claimed = vec![false; mesh.vertices.len()];
     for y in lo..hi {
         for z in lo..hi {
             for x in lo..hi {
@@ -262,31 +284,61 @@ pub fn mesh_block(block: &LocalField, margin: i32) -> ChunkMesh {
                         (b - a).cross(c - a)
                     };
                     let normals = [normal(tri(0)), normal(tri(1))];
-                    let mat = block.mat[if s0 { i } else { i + off }];
-                    let def = material::def(mat);
-                    let mat_sharp = mat as u16 | ((def.sharpness * 255.0) as u16) << 8;
+                    let mat = block.mat[if s0 { i } else { i + off }] as usize % material::MATERIAL_COUNT;
+                    let def = &material::MATERIALS[mat];
                     for t in 0..2 {
                         let ids = tri(t);
                         let room = mesh.vertices.len() + 3 <= NO_VERTEX as usize;
                         if def.sharpness < 0.5 || !room {
+                            // The other soft material with most to say here, if any.
+                            let mut other = mat;
+                            if borders && is_soft(mat) {
+                                let mut sum = [0u32; material::MATERIAL_COUNT];
+                                for id in ids {
+                                    let s = &mut vertex_shares[id as usize];
+                                    if *s == NO_SHARES {
+                                        *s = shares(block, bases[id as usize] as usize);
+                                    }
+                                    for m in 0..material::MATERIAL_COUNT {
+                                        sum[m] += s[m] as u32;
+                                    }
+                                }
+                                let best = (1..material::MATERIAL_COUNT)
+                                    .filter(|&m| m != mat && is_soft(m))
+                                    .max_by_key(|&m| (sum[m], std::cmp::Reverse(m)))
+                                    .filter(|&m| sum[m] > 0);
+                                other = best.unwrap_or(mat);
+                            }
+                            let (lo, hi) = (mat.min(other), mat.max(other));
                             for id in ids {
-                                let slot = &mut variants[id as usize][mat as usize & 3];
-                                if mesh.vertices[id as usize].mat_sharp == mat_sharp {
+                                let share = if lo == hi {
+                                    0
+                                } else {
+                                    let s = vertex_shares[id as usize];
+                                    let (a, b) = (s[lo] as u32, s[hi] as u32);
+                                    (b * 510 + a + b) / (2 * (a + b).max(1))
+                                };
+                                let mats = (lo | hi << 4) as u16 | (share as u16) << 8;
+                                let slot = &mut variants[id as usize][lo * 4 + hi];
+                                if *slot == NO_VERTEX && !claimed[id as usize] {
+                                    claimed[id as usize] = true;
+                                    mesh.vertices[id as usize].mats = mats;
                                     *slot = id;
                                 } else if *slot == NO_VERTEX && room {
                                     *slot = mesh.vertices.len() as u16;
-                                    mesh.vertices.push(MeshVertex { mat_sharp, ..mesh.vertices[id as usize] });
+                                    mesh.vertices.push(MeshVertex { mats, ..mesh.vertices[id as usize] });
                                 }
-                                // Out of indices: blend rather than drop the triangle.
+                                // Out of indices: miscolour rather than drop the triangle.
                                 mesh.indices.push(if *slot == NO_VERTEX { id } else { *slot });
                             }
                             continue;
                         }
+                        let mats = (mat | mat << 4) as u16;
                         // A sliver has no stable normal of its own: borrow its
                         // partner's, or fall back to the smooth one.
                         let n = [normals[t], normals[1 - t]].into_iter().find(|n| n.length_squared() > 1e-8);
                         for id in ids {
-                            let mut vertex = MeshVertex { mat_sharp, ..mesh.vertices[id as usize] };
+                            let mut vertex = MeshVertex { mats, ..mesh.vertices[id as usize] };
                             if let Some(n) = n {
                                 vertex.normal = oct_encode(n.normalize());
                             }
@@ -299,7 +351,7 @@ pub fn mesh_block(block: &LocalField, margin: i32) -> ChunkMesh {
         }
     }
 
-    // Drop shared vertices nothing refers to (apron cells, faceted or recoloured ones).
+    // Drop shared vertices nothing refers to (apron cells and faceted ones).
     let mut remap = vec![NO_VERTEX; mesh.vertices.len()];
     for &i in &mesh.indices {
         remap[i as usize] = 0;
@@ -452,8 +504,26 @@ mod tests {
         assert!(b0 < a0 && b1 > a1 && a0 - b0 <= POS_SCALE as u16 * 2);
     }
 
+    /// Flat ground, solid below y = 8, of dirt with sand wherever `sand` says.
+    fn ground(sand: impl Fn(IVec3) -> bool) -> Volume {
+        let mut vol = Volume::new();
+        for i in 0..125 {
+            let pos = IVec3::new(i % 5, i / 25, i / 5 % 5) - 2;
+            vol.insert(pos, Chunk::AIR);
+        }
+        for y in -8..8 {
+            for z in -40..72 {
+                for x in -40..72 {
+                    let p = IVec3::new(x, y, z);
+                    vol.set(p, Sample { fill: 255, mat: if sand(p) { 3 } else { 2 } });
+                }
+            }
+        }
+        vol
+    }
+
     #[test]
-    fn every_triangle_is_one_material() {
+    fn triangles_agree_on_their_materials_and_stone_never_mixes() {
         // The stone ball with a band of dirt and a cap of sand.
         let center = Vec3::new(0.7, -1.3, 2.1);
         let mut vol = ball_volume(20.0, center);
@@ -475,20 +545,89 @@ mod tests {
                 }
             }
         }
-        let mut per_material = [0usize; 4];
+        let mut shown = [0usize; 4];
+        let mut mixed = 0;
         for cy in -1..1 {
             for cz in -1..1 {
                 for cx in -1..1 {
                     let pos = IVec3::new(cx, cy, cz);
                     let mesh = mesh_block(&block_of(&vol, pos), 0);
                     for t in mesh.indices.chunks_exact(3) {
-                        let m = [t[0], t[1], t[2]].map(|i| mesh.vertices[i as usize].mat_sharp & 0xff);
-                        assert!(m[0] == m[1] && m[1] == m[2], "triangle blends materials {m:?}");
-                        per_material[m[0] as usize] += 1;
+                        let v = [t[0], t[1], t[2]].map(|i| mesh.vertices[i as usize]);
+                        let ([lo, hi], _) = v[0].materials();
+                        assert!(v.iter().all(|v| v.materials().0 == [lo, hi]), "triangle disagrees on its pair");
+                        assert!(lo == hi || (lo, hi) == (2, 3), "pair {lo} {hi}");
+                        if lo != hi {
+                            mixed += 1;
+                        }
+                        for v in v {
+                            // Well away from the line each material is itself.
+                            let y = v.cells().y + chunk_origin(pos).y as f32;
+                            let (m, share) = v.materials();
+                            let show = m[(share >= 128) as usize];
+                            let expect = if y > 15.0 {
+                                3
+                            } else if y > 3.5 && y < 10.0 {
+                                2
+                            } else if y < 1.5 {
+                                1
+                            } else {
+                                show
+                            };
+                            assert_eq!(show, expect, "at height {y}");
+                            shown[show as usize] += 1;
+                        }
                     }
                 }
             }
         }
-        assert!(per_material[1..].iter().all(|&n| n > 100), "{per_material:?}");
+        assert!(shown[1..].iter().all(|&n| n > 300) && mixed > 100, "{shown:?} {mixed}");
+    }
+
+    #[test]
+    fn soft_materials_meet_along_a_smooth_line() {
+        // Sand beyond a diagonal: in the samples the border is a staircase.
+        for slope in [1, 2] {
+            let vol = ground(|p| p.x + slope * p.z > 40);
+            let mesh = mesh_block(&block_of(&vol, IVec3::ZERO), 0);
+            let (mut crossings, mut worst) = (0, 0.0f32);
+            for t in mesh.indices.chunks_exact(3) {
+                let v = [t[0], t[1], t[2]].map(|i| mesh.vertices[i as usize]);
+                for (a, b) in [(v[0], v[1]), (v[1], v[2]), (v[2], v[0])] {
+                    let (sa, sb) = (a.materials().1 as f32 - 127.5, b.materials().1 as f32 - 127.5);
+                    if (sa > 0.0) == (sb > 0.0) {
+                        continue;
+                    }
+                    // Where the line crosses this edge, and how far that is
+                    // from the true diagonal, in cells.
+                    let p = a.cells().lerp(b.cells(), sa / (sa - sb));
+                    let off = (p.x + slope as f32 * p.z - 40.5) / (1.0 + (slope * slope) as f32).sqrt();
+                    worst = worst.max(off.abs());
+                    crossings += 1;
+                }
+            }
+            assert!(crossings > 40, "{crossings}");
+            // A staircase strays half a cell and more.
+            assert!(worst < 0.2, "slope {slope}: the line strays {worst} cells");
+        }
+    }
+
+    #[test]
+    fn a_vertex_has_one_share_whichever_node_meshes_it() {
+        let vol = ground(|p| p.x * 3 + p.z > 70 || (p.x - 30).pow(2) + (p.z - 31).pow(2) < 60);
+        let mut seen: HashMap<[i32; 3], u8> = HashMap::new();
+        for pos in [IVec3::ZERO, IVec3::Z, IVec3::X, IVec3::new(1, 0, 1)] {
+            let mesh = mesh_block(&block_of(&vol, pos), 0);
+            for v in &mesh.vertices {
+                let ([lo, hi], share) = v.materials();
+                if lo == hi {
+                    continue;
+                }
+                let o = chunk_origin(pos) * POS_SCALE as i32;
+                let key = [0, 1, 2].map(|k| o[k] + v.pos[k] as i32);
+                assert_eq!(*seen.entry(key).or_insert(share), share, "a border jumps between nodes");
+            }
+        }
+        assert!(seen.len() > 50);
     }
 }

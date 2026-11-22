@@ -22,7 +22,8 @@ struct Globals {
 const DEPTH_PUSH: f32 = 2.0;
 
 struct VsIn {
-    // xyz: (cells + 2) * 1024, w: material in the low byte.
+    // xyz: (cells + 3) * 1024. w: two materials in the low byte, four bits
+    // each, and the second one's share of this vertex in the high byte.
     @location(0) pos: vec4<u32>,
     @location(1) normal: vec2<f32>,
     // xyz: the node's origin relative to the camera chunk's origin, in base
@@ -35,8 +36,10 @@ struct VsOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) world: vec3<f32>,
     @location(1) normal: vec3<f32>,
-    // Every triangle is one material: its three vertices agree.
-    @location(2) @interpolate(flat) color: vec3<f32>,
+    // The triangle's two materials: its three vertices agree.
+    @location(2) @interpolate(flat) mats: u32,
+    // The second material's share, 0 to 1.
+    @location(3) share: f32,
 }
 
 fn oct_decode(e: vec2<f32>) -> vec3<f32> {
@@ -63,7 +66,8 @@ fn vs(in: VsIn) -> VsOut {
         out.clip.z = out.clip.z * out.clip.w / (out.clip.w + push);
     }
     out.normal = oct_decode(in.normal);
-    out.color = g.materials[in.pos.w & 3u].rgb;
+    out.mats = in.pos.w & 0xffu;
+    out.share = f32(in.pos.w >> 8u) / 255.0;
     return out;
 }
 
@@ -77,13 +81,17 @@ struct FsOut {
 
 @fragment
 fn fs(in: VsOut) -> FsOut {
+    // Two soft materials meet where their shares are equal: a sharp line,
+    // smoothed over one pixel, not a fade.
+    let second = clamp((in.share - 0.5) / max(fwidth(in.share), 1e-5) + 0.5, 0.0, 1.0);
+    let albedo = mix(g.materials[in.mats & 3u].rgb, g.materials[(in.mats >> 4u) & 3u].rgb, second);
     let to_camera = g.camera.xyz - in.world;
     // Faceted materials carry their face normal in the vertices.
     let n = normalize(in.normal);
 
     let hemi = mix(g.ground_color.rgb, g.sky_color.rgb, n.y * 0.5 + 0.5);
     let sun = g.sun_color.rgb * max(dot(n, g.sun_dir.xyz), 0.0);
-    var color = in.color * (hemi + sun);
+    var color = albedo * (hemi + sun);
 
     let distance = length(to_camera);
     let fog = smoothstep(g.fog.x, g.fog.y, distance);
