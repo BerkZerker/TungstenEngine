@@ -71,7 +71,8 @@ pub fn brush_outline(lines: &mut LineBatch, game: &Game, camera: &Camera) {
 
 pub fn build(text: &mut TextBatch, info: &HudInfo) {
     text.clear();
-    let s = (info.scale * 3.0).round().max(1.0);
+    // A quarter larger than the crosshair, to the nearest half pixel.
+    let s = ((info.scale * 5.0).round() * 0.5).max(1.0);
 
     // Crosshair.
     let c = (info.scale * 2.0).round().max(1.0);
@@ -165,7 +166,7 @@ pub fn build(text: &mut TextBatch, info: &HudInfo) {
         g.tick
     );
     let _ = write!(out, "{}", info.gpu);
-    text.push(6.0 * s, 6.0 * s, s, WHITE, &out);
+    panel(text, 6.0 * s, 6.0 * s, s, WHITE, &out);
 
     // The key list, on as many lines as the window's width needs.
     let help = "WASD move  Space jump  Shift run  Ctrl crouch  LMB break  RMB place  1-3 material  wheel brush  Space x2 fly  V vsync  F3 debug";
@@ -181,5 +182,13 @@ pub fn build(text: &mut TextBatch, info: &HudInfo) {
         }
     }
     let y = info.size.1 as f32 - TextBatch::line_height(s) * lines.len() as f32 - 4.0 * s;
-    text.push(6.0 * s, y, s, DIM, &lines.join("\n"));
+    panel(text, 6.0 * s, y, s, DIM, &lines.join("\n"));
+}
+
+/// Text on a translucent grey box fitted to it.
+fn panel(text: &mut TextBatch, x: f32, y: f32, s: f32, color: [u8; 4], content: &str) {
+    let (width, height) = TextBatch::measure(s, content);
+    let pad = 3.0 * s;
+    text.rect(x - pad, y - pad, width + 2.0 * pad, height + 2.0 * pad, [40, 40, 40, 160]);
+    text.push(x, y, s, color, content);
 }
