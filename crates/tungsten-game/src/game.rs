@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use glam::{DVec3, IVec3, Vec3};
-use tungsten_core::edit::{Exclude, FP, Op};
+use tungsten_core::edit::{EditRules, Exclude, FP, Op};
 use tungsten_core::material::{self, CarveMode};
 use tungsten_core::raycast::{RayHit, raycast};
 use tungsten_core::{Material, WorldParams};
@@ -22,6 +22,8 @@ pub const BRUSH_STEP: f32 = 0.25;
 const CUT_TICKS: u64 = 6;
 /// Metres of mining it takes to break stone, which then goes all at once.
 const STONE_WORK: f32 = 0.75;
+/// Chips knocked off, evenly spaced, before the shard goes.
+const STONE_CHIPS: u32 = 3;
 /// How far the player can reach to break or place, metres.
 pub const REACH: f32 = 6.0;
 /// The number key that selects water, and what the player file calls it.
@@ -47,6 +49,7 @@ pub struct Game {
     /// Ticks the break button has been held, and the mining done on stone since it last broke.
     mining_ticks: u64,
     stone_work: f32,
+    stone_chips: u32,
     /// Where the player's state is saved, if the world is persistent.
     player_file: Option<PathBuf>,
     /// Mesh changes not yet handed to the renderer.
@@ -92,6 +95,7 @@ impl Game {
             space_taps: DoubleTap::default(),
             mining_ticks: 0,
             stone_work: 0.0,
+            stone_chips: 0,
             player_file: args.world.as_ref().map(|d| d.join("player.txt")),
             events: Vec::new(),
         };
@@ -252,6 +256,30 @@ impl Game {
         }
     }
 
+    /// Knock a chip off the stone beside the point aimed at, on a different
+    /// side each time: the sign that a shard is giving way.
+    fn chip(&mut self, hit: &RayHit, eye: DVec3, n: u32) {
+        let cell = self.params().cell_size;
+        let size = EditRules::new(&self.params()).chips.spacing as f32 / FP as f32;
+        let side = hit.normal.any_orthonormal_vector();
+        let up = hit.normal.cross(side);
+        // Three places round the aim point, then the point itself.
+        for attempt in 0..4 {
+            let turn = (n + attempt) as f32 * std::f32::consts::TAU / 3.0 + 0.5;
+            let offset = if attempt < 3 { (side * turn.cos() + up * turn.sin()) * (0.7 * size) } else { Vec3::ZERO };
+            // Onto the surface there, and just under it.
+            let dir = (hit.pos + offset.as_dvec3() - eye).as_vec3().normalize_or_zero();
+            let Some(at) = raycast(self.world.volume(), eye, dir, REACH / cell + size) else { continue };
+            if material::def(at.material).carve != CarveMode::Shards {
+                continue;
+            }
+            let center = at.pos - (at.normal * (0.3 * size)).as_dvec3();
+            if !self.world.edit(&Op::Chip { center: center.to_array().map(to_fp) }).chunks.is_empty() {
+                return;
+            }
+        }
+    }
+
     fn edit(&mut self, input: &mut Input) {
         let cell = self.params().cell_size as f64;
         let eye = self.player.eye(1.0) / cell;
@@ -259,7 +287,7 @@ impl Game {
         self.aim = raycast(self.world.volume(), eye, dir, REACH / cell as f32);
         let clicks = std::mem::take(&mut input.place_clicks);
         if !input.break_held {
-            (self.mining_ticks, self.stone_work) = (0, 0.0);
+            (self.mining_ticks, self.stone_work, self.stone_chips) = (0, 0.0, 0);
         }
         let Some(hit) = self.aim else { return };
         let radius = (self.brush_radius as f64 / cell * FP as f64).round() as i64;
@@ -279,17 +307,24 @@ impl Game {
                     let depth = (def.dig_speed * CUT_TICKS as f32 * TICK as f32).min(self.brush_radius);
                     Op::Break { center: ball(depth), radius, nearest: false }
                 }),
-                // Stone holds until enough work is done, then the shard aimed
-                // at breaks off with every other the ball has reached.
+                // Stone chips as the work goes in, then the shard aimed at
+                // breaks off with every other the ball has reached.
                 CarveMode::Shards => {
                     self.stone_work += def.dig_speed * TICK as f32;
-                    (self.stone_work >= STONE_WORK).then(|| {
-                        self.stone_work = 0.0;
+                    if self.stone_work >= STONE_WORK {
+                        (self.stone_work, self.stone_chips) = (0.0, 0);
                         // Centred just inside the surface, so the shard it is
                         // in is the one being looked at.
                         let center = hit.pos - (hit.normal * (self.brush_radius.min(0.4) / cell as f32)).as_dvec3();
-                        Op::Break { center: center.to_array().map(to_fp), radius, nearest: true }
-                    })
+                        Some(Op::Break { center: center.to_array().map(to_fp), radius, nearest: true })
+                    } else {
+                        let due = (self.stone_work / STONE_WORK * (STONE_CHIPS + 1) as f32) as u32;
+                        if due > self.stone_chips {
+                            self.chip(&hit, eye, self.stone_chips);
+                            self.stone_chips = due;
+                        }
+                        None
+                    }
                 }
             };
             self.mining_ticks += 1;

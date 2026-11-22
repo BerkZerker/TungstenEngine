@@ -20,7 +20,8 @@ next. Old worlds are not kept readable.
 - **Truth.** Seed plus an edit log. An edit is a shape (`Op`): `Break` (sphere;
   stone gives way in whole shards whose centre is inside it), `Place` (sphere
   of a material, never repainting solid, leaving the player's capsule out) and
-  `Clear` (lattice points of a fragment that broke off). Positions are
+  `Chip` (the small piece of stone a point is in) and `Clear` (lattice points
+  of a fragment that broke off). Positions are
   fixed-point, 1/256 of the base cell.
 - **Levels.** Level L samples every `cell_size * 2^L`; six levels, 0.25 m to
   8 m. A node is a 32-cell chunk of one level. An op is a pure per-sample
@@ -60,9 +61,13 @@ next. Old worlds are not kept readable.
   interpolated shares are equal, one pixel wide. No colour fade.
 - **Mining.** Dirt and sand: every 6 ticks a ball is cut, sunk 0.1 s of the
   material's dig speed (dirt 2.5 m/s, sand 5 m/s) into the surface along its
-  normal. Stone: after 0.75 m of work at 1 m/s the shard under the crosshair
-  breaks off with every other shard whose centre is in the brush. The brush
-  goes down to 0.25 m.
+  normal. Stone: over 0.75 m of work at 1 m/s three chips come off around the
+  crosshair, then the shard under it breaks off with every other shard whose
+  centre is in the brush. A chip is a piece of a second, finer pattern (a
+  third of a shard across) and is an edit like any other (`Op::Chip`): it
+  stays if mining stops, is saved, and only the count towards the shard
+  starts over. Meant to be extended to the other materials. The brush goes
+  down to 0.25 m.
 - **Saves.** Region files of 16^3 edit cells per tier, each cell its ops plus
   baked overlay. World format 2.
 

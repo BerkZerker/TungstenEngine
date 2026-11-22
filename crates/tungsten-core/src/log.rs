@@ -296,6 +296,10 @@ fn put_op(out: &mut Vec<u8>, op: &Op) {
                 [e.x, e.z, e.y0, e.y1, e.radius].iter().for_each(|&v| put_signed(out, v));
             }
         }
+        Op::Chip { center } => {
+            out.push(5);
+            center.iter().for_each(|&c| put_signed(out, c));
+        }
         Op::Clear { origin, cells } => {
             out.push(4);
             origin.to_array().iter().for_each(|&c| put_signed(out, c as i64));
@@ -312,6 +316,7 @@ fn get_op(bytes: &[u8], at: &mut usize) -> Result<Op, String> {
     };
     Ok(match tag {
         0 | 1 => Op::Break { center: three(at)?, radius: get_signed(bytes, at)?, nearest: tag == 1 },
+        5 => Op::Chip { center: three(at)? },
         2 | 3 => {
             let (center, radius, material) = (three(at)?, get_signed(bytes, at)?, get_u8(bytes, at)?);
             let exclude = if tag == 3 {
@@ -408,6 +413,7 @@ mod tests {
                 match k % 5 {
                     0 | 1 => Op::Break { center, radius: 5 * FP + k * 30, nearest: k % 2 == 0 },
                     2 => Op::Place { center, radius: 6 * FP, material: Material::SAND, exclude: None },
+                    3 if k % 2 == 0 => Op::Chip { center },
                     3 => Op::Place { center, radius: 7 * FP, material: Material::STONE, exclude: None },
                     _ => Op::Clear {
                         origin: IVec3::new((center[0] / FP) as i32, (center[1] / FP) as i32, (center[2] / FP) as i32),

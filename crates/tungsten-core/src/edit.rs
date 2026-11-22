@@ -41,6 +41,9 @@ pub enum Op {
     /// those whose centre is inside the ball and, if `nearest`, the one the
     /// ball's centre is in.
     Break { center: [i64; 3], radius: i64, nearest: bool },
+    /// Knock off the chip of stone that `center` is in. Chips are a finer
+    /// pattern than shards; other materials are left alone.
+    Chip { center: [i64; 3] },
     /// Add a ball of `material` (stone: the shards centred inside it). Never
     /// repaints what is already solid and leaves `exclude` empty.
     Place { center: [i64; 3], radius: i64, material: u8, exclude: Option<Exclude> },
@@ -52,9 +55,10 @@ pub enum Op {
 /// World constants the edit rules depend on.
 #[derive(Clone, Copy, Debug)]
 pub struct EditRules {
-    seed: u64,
-    /// Spacing of the shard pattern stone breaks along, fixed-point base cells.
-    pub shard_spacing: i64,
+    /// The pattern stone breaks along.
+    pub shards: Pattern,
+    /// The finer pattern it chips along first.
+    pub chips: Pattern,
     /// Pieces of fewer base samples than this are broken off; see `WorldParams::min_fragment`.
     pub fragment_samples: u32,
 }
@@ -63,23 +67,35 @@ impl EditRules {
     pub fn new(params: &WorldParams) -> Self {
         // About 1.5 m, and never finer than two cells: smaller shards cannot
         // be resolved by the lattice.
-        let spacing = ((1.5 / params.cell_size as f64) * FP as f64).round() as i64;
+        let spacing = (((1.5 / params.cell_size as f64) * FP as f64).round() as i64).max(2 * FP);
         let side = params.min_fragment.max(0.0) as f64 / params.cell_size as f64;
         Self {
-            seed: derive(params.seed, 0x53_4841_5244),
-            shard_spacing: spacing.max(2 * FP),
+            shards: Pattern { seed: derive(params.seed, 0x53_4841_5244), spacing },
+            // A third of a shard across, under the same limit.
+            chips: Pattern { seed: derive(params.seed, 0x43_4849_5053), spacing: (spacing / 3).max(2 * FP) },
             fragment_samples: (side * side * side).round().min(4096.0) as u32,
         }
     }
+}
 
-    /// No point is further than this from the centre of the shard it is in.
-    fn shard_reach(&self) -> i64 {
-        self.shard_spacing * 8 / 5
+/// A jittered grid of centres dividing space into angular pieces: a point
+/// belongs to the centre nearest to it.
+#[derive(Clone, Copy, Debug)]
+pub struct Pattern {
+    seed: u64,
+    /// Spacing of the grid, fixed-point base cells.
+    pub spacing: i64,
+}
+
+impl Pattern {
+    /// No point is further than this from the centre of the piece it is in.
+    fn reach(&self) -> i64 {
+        self.spacing * 8 / 5
     }
 
-    /// Grid cell of the shard pattern holding the site nearest to `w`.
+    /// Grid cell of the pattern holding the site nearest to `w`.
     fn nearest_site(&self, w: [i64; 3]) -> [i64; 3] {
-        let g: [i64; 3] = w.map(|v| v.div_euclid(self.shard_spacing));
+        let g: [i64; 3] = w.map(|v| v.div_euclid(self.spacing));
         let (mut best, mut best_d2) = (g, i64::MAX);
         for dy in -1..=1 {
             for dz in -1..=1 {
@@ -96,10 +112,10 @@ impl EditRules {
         best
     }
 
-    /// World position of the shard centre in grid cell `g`.
+    /// World position of the centre in grid cell `g`.
     #[inline]
     fn site(&self, g: [i64; 3]) -> [i64; 3] {
-        let sp = self.shard_spacing;
+        let sp = self.spacing;
         let (inset, span) = (sp / 10, (sp * 8 / 10) as u64);
         let h = hash3(self.seed, g[0], g[1], g[2]);
         let jitter = [h & 0xffff, (h >> 16) & 0xffff, (h >> 32) & 0xffff];
@@ -111,11 +127,13 @@ impl Op {
     /// Lattice bounds at `level` (inclusive) of the samples this op can change.
     pub fn bounds(&self, rules: &EditRules, level: u8) -> (IVec3, IVec3) {
         let step = 1i64 << level;
-        let ball = |center: &[i64; 3], radius: i64, shards: bool| {
+        let ball = |center: &[i64; 3], radius: i64, pattern: Option<&Pattern>| {
             // Fill saturates two cells of the level away from a surface.
             let soft = 2 * FP * step;
-            let reach =
-                if shards { radius.max(rules.shard_reach()) + rules.shard_reach() + soft } else { radius + soft };
+            let reach = match pattern {
+                Some(p) => radius.max(p.reach()) + p.reach() + soft,
+                None => radius + soft,
+            };
             let unit = FP * step;
             (
                 IVec3::from_array(center.map(|c| (c - reach).div_euclid(unit) as i32)),
@@ -124,9 +142,11 @@ impl Op {
         };
         match self {
             // Stone may be anywhere under a break brush.
-            Op::Break { center, radius, .. } => ball(center, *radius, true),
+            Op::Break { center, radius, .. } => ball(center, *radius, Some(&rules.shards)),
+            Op::Chip { center } => ball(center, 0, Some(&rules.chips)),
             Op::Place { center, radius, material, .. } => {
-                ball(center, *radius, material::def(*material).carve == CarveMode::Shards)
+                let shards = material::def(*material).carve == CarveMode::Shards;
+                ball(center, *radius, shards.then_some(&rules.shards))
             }
             Op::Clear { origin, cells } => {
                 let reach =
@@ -198,9 +218,9 @@ impl Grid {
     }
 }
 
-/// The shard centres around a box of samples, relative to a brush centre.
+/// The centres of a pattern around a box of samples, relative to a brush centre.
 struct Sites {
-    spacing: i64,
+    pattern: Pattern,
     /// Grid cell of index (0, 0, 0).
     base: [i64; 3],
     dims: [i64; 3],
@@ -211,29 +231,29 @@ struct Sites {
 impl Sites {
     /// Sites for every grid cell a sample between world positions `min` and
     /// `max` can ask about.
-    fn new(rules: &EditRules, center: [i64; 3], min: [i64; 3], max: [i64; 3]) -> Self {
-        let sp = rules.shard_spacing;
+    fn new(pattern: &Pattern, center: [i64; 3], min: [i64; 3], max: [i64; 3]) -> Self {
+        let sp = pattern.spacing;
         let base: [i64; 3] = std::array::from_fn(|a| min[a].div_euclid(sp) - 1);
         let dims: [i64; 3] = std::array::from_fn(|a| max[a].div_euclid(sp) + 1 - base[a] + 1);
         let mut pos = Vec::with_capacity((dims[0] * dims[1] * dims[2]) as usize);
         for gy in 0..dims[1] {
             for gz in 0..dims[2] {
                 for gx in 0..dims[0] {
-                    let s = rules.site([base[0] + gx, base[1] + gy, base[2] + gz]);
+                    let s = pattern.site([base[0] + gx, base[1] + gy, base[2] + gz]);
                     pos.push([s[0] - center[0], s[1] - center[1], s[2] - center[2]]);
                 }
             }
         }
-        Self { spacing: sp, base, dims, pos }
+        Self { pattern: *pattern, base, dims, pos }
     }
 
     /// Which sites a ball takes: those inside it and, if `nearest`, the one
     /// whose shard holds its centre.
-    fn taken(&self, rules: &EditRules, center: [i64; 3], radius: i64, nearest: bool) -> Vec<bool> {
+    fn taken(&self, center: [i64; 3], radius: i64, nearest: bool) -> Vec<bool> {
         let r2 = radius * radius;
-        let mut taken: Vec<bool> = self.pos.iter().map(|&s| len2(s) <= r2).collect();
+        let mut taken: Vec<bool> = self.pos.iter().map(|&s| radius > 0 && len2(s) <= r2).collect();
         if nearest {
-            let g = rules.nearest_site(center);
+            let g = self.pattern.nearest_site(center);
             let l: [i64; 3] = std::array::from_fn(|a| g[a] - self.base[a]);
             if (0..3).all(|a| l[a] >= 0 && l[a] < self.dims[a]) {
                 taken[self.index(l)] = true;
@@ -252,7 +272,7 @@ impl Sites {
     /// the brush centre.
     #[inline]
     fn candidates(&self, w: [i64; 3], p: [i64; 3]) -> [(u32, i64); 27] {
-        let g: [i64; 3] = std::array::from_fn(|a| w[a].div_euclid(self.spacing) - self.base[a]);
+        let g: [i64; 3] = std::array::from_fn(|a| w[a].div_euclid(self.pattern.spacing) - self.base[a]);
         let mut out = [(0u32, 0i64); 27];
         let mut n = 0;
         for dy in -1..=1 {
@@ -333,7 +353,13 @@ pub fn apply(op: &Op, rules: &EditRules, field: &mut LocalField, clip: Option<(I
     let grid = Grid::of(field);
     match op {
         Op::Break { center, radius, nearest } => {
-            break_brush(grid, &mut field.fill, &mut field.mat, rules, *center, *radius, *nearest, lo, hi)
+            if cut_ball(grid, &mut field.fill, &mut field.mat, *center, *radius, lo, hi) {
+                let cut = (*center, *radius, *nearest);
+                break_pieces(grid, &mut field.fill, &mut field.mat, &rules.shards, cut, lo, hi)
+            }
+        }
+        Op::Chip { center } => {
+            break_pieces(grid, &mut field.fill, &mut field.mat, &rules.chips, (*center, 0, true), lo, hi)
         }
         Op::Place { center, radius, material, exclude } => {
             place_brush(grid, &mut field.fill, &mut field.mat, rules, *center, *radius, *material, exclude, lo, hi)
@@ -356,24 +382,12 @@ pub fn apply(op: &Op, rules: &EditRules, field: &mut LocalField, clip: Option<(I
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn break_brush(
-    grid: Grid,
-    fill: &mut [u8],
-    mat: &mut [u8],
-    rules: &EditRules,
-    center: [i64; 3],
-    radius: i64,
-    nearest: bool,
-    lo: IVec3,
-    hi: IVec3,
-) {
+/// Cut a ball out of the smooth materials. Says whether any stone is in reach.
+fn cut_ball(grid: Grid, fill: &mut [u8], mat: &mut [u8], center: [i64; 3], radius: i64, lo: IVec3, hi: IVec3) -> bool {
     let per_fill = FP_PER_FILL * grid.unit / FP;
     let soft = radius + 2 * grid.unit;
     let soft2 = soft * soft;
     let mut any_stone = false;
-
-    // Smooth materials: cut to the ball.
     grid.for_samples(lo, hi, center, |i, _, p| {
         if fill[i] == 0 {
             return;
@@ -392,16 +406,26 @@ fn break_brush(
             mat[i] = 0;
         }
     });
-    if !any_stone {
-        return;
-    }
+    any_stone
+}
 
-    // Stone: whole shards break off, leaving flat faces where they met their
-    // neighbours.
-    let sites = Sites::new(rules, center, grid.world(lo), grid.world(hi - 1));
-    let taken = sites.taken(rules, center, radius, nearest);
+/// Stone gives way in whole pieces of `pattern`, leaving flat faces where
+/// they met their neighbours: the pieces centred within `radius` of `center`
+/// and, if `nearest`, the one `center` is in.
+fn break_pieces(
+    grid: Grid,
+    fill: &mut [u8],
+    mat: &mut [u8],
+    pattern: &Pattern,
+    (center, radius, nearest): ([i64; 3], i64, bool),
+    lo: IVec3,
+    hi: IVec3,
+) {
+    let per_fill = FP_PER_FILL * grid.unit / FP;
+    let sites = Sites::new(pattern, center, grid.world(lo), grid.world(hi - 1));
+    let taken = sites.taken(center, radius, nearest);
     let Some((near, far)) = sites.extent(&taken) else { return };
-    let margin = rules.shard_reach() + 2 * grid.unit;
+    let margin = pattern.reach() + 2 * grid.unit;
     grid.for_samples(lo, hi, center, |i, w, p| {
         if fill[i] == 0 || material::def(mat[i]).carve != CarveMode::Shards {
             return;
@@ -474,10 +498,10 @@ fn place_brush(
     // Stone: the union of the shards centred inside the brush, so placed
     // stone is angular and lines up with the pattern it later breaks along.
     // A brush smaller than the pattern still places the shard it is in.
-    let sites = Sites::new(rules, center, grid.world(lo), grid.world(hi - 1));
-    let taken = sites.taken(rules, center, radius, true);
+    let sites = Sites::new(&rules.shards, center, grid.world(lo), grid.world(hi - 1));
+    let taken = sites.taken(center, radius, true);
     let Some((near, far)) = sites.extent(&taken) else { return };
-    let margin = rules.shard_reach() + 2 * grid.unit;
+    let margin = rules.shards.reach() + 2 * grid.unit;
     grid.for_samples(lo, hi, center, |i, w, p| {
         if (0..3).any(|a| p[a] < near[a] - margin || p[a] > far[a] + margin) {
             return;
@@ -611,7 +635,7 @@ pub fn edit_volume(volume: &mut Volume, rules: &EditRules, op: &Op) -> EditOutco
     let covered = volume.covers(min, dims);
     let mut out = EditOutcome { chunks: Vec::new(), changed: None, min, max, fragments: None, covered };
 
-    let before = matches!(op, Op::Break { .. }).then(|| field.fill.clone());
+    let before = matches!(op, Op::Break { .. } | Op::Chip { .. }).then(|| field.fill.clone());
     apply(op, rules, &mut field, None);
     // Unloaded space reads as air, which would make whatever borders it look loose.
     if let (Some(before), true) = (before, covered) {
@@ -685,6 +709,28 @@ mod tests {
     }
 
     #[test]
+    fn a_chip_is_a_small_piece_of_stone_and_nothing_else() {
+        let rules = rules();
+        let mut vol = volume_of(STONE);
+        let before = solid_count(&vol);
+        let center = [300, 200, -700];
+        let out = edit_volume(&mut vol, &rules, &Op::Chip { center });
+        assert!(!out.chunks.is_empty());
+        // About a chip's worth went: far less than a shard.
+        let removed = (before - solid_count(&vol)) as f64;
+        let chip = (rules.chips.spacing as f64 / FP as f64).powi(3);
+        let shard = (rules.shards.spacing as f64 / FP as f64).powi(3);
+        assert!(removed >= 1.0 && removed < chip * 4.0 && removed < shard * 0.3, "removed {removed}, chip {chip}");
+        // The chip that went is the one the centre is in.
+        assert!(!vol.get(IVec3::new(1, 1, -3)).unwrap().solid());
+        // The same chip again has nothing left to take.
+        assert!(edit_volume(&mut vol, &rules, &Op::Chip { center }).chunks.is_empty());
+        // Soft ground does not chip.
+        let mut vol = volume_of(DIRT);
+        assert!(edit_volume(&mut vol, &rules, &Op::Chip { center }).chunks.is_empty());
+    }
+
+    #[test]
     fn stone_breaks_in_whole_shards() {
         let rules = rules();
         let mut vol = volume_of(STONE);
@@ -698,7 +744,7 @@ mod tests {
         assert!(!out.chunks.is_empty());
         // One shard of about spacing³ went, not a one-cell ball.
         let removed = (before - solid_count(&vol)) as f64;
-        let shard = (rules.shard_spacing as f64 / FP as f64).powi(3);
+        let shard = (rules.shards.spacing as f64 / FP as f64).powi(3);
         assert!(removed > shard * 0.2 && removed < shard * 4.0, "removed {removed}, a shard is about {shard}");
         // The shard that went is the one the centre is in.
         assert!(!vol.get(IVec3::new(1, 0, -3)).unwrap().solid());
@@ -714,7 +760,7 @@ mod tests {
                 for x in -30..30 {
                     let p = IVec3::new(x, y, z);
                     let w = p.to_array().map(|v| v as i64 * FP);
-                    let site = rules.site(rules.nearest_site(w));
+                    let site = rules.shards.site(rules.shards.nearest_site(w));
                     let d = [site[0] - center[0], site[1] - center[1], site[2] - center[2]];
                     let taken = len2(d) <= radius * radius;
                     let solid = vol.get(p).unwrap().solid();
@@ -810,6 +856,9 @@ mod tests {
         let mut ops = Vec::new();
         for k in 0..24i64 {
             let center = [k * 310 - 3000, 200 - k * 90, k * 170 - 1500];
+            if k % 3 == 0 {
+                ops.push(Op::Chip { center: [center[0] + 700, center[1], center[2] - 500] });
+            }
             ops.push(match k % 4 {
                 0 => Op::Break { center, radius: 5 * FP + k * 40, nearest: false },
                 1 => Op::Place { center, radius: 4 * FP, material: Material::SAND, exclude: None },
