@@ -184,8 +184,10 @@ to the terrain, but the player, sand and collision do not know it is there.
     (0.2 m to 1.6 m), rounding into a column where it falls. A sheet thins to
     nothing at its edges, where the ground comes up through it, and at its
     front and its tail; where one stretch hands over to the next it keeps its
-    width, so a run of several reads as one. An active pour draws a cosmetic
-    parabolic `PourArc` from the player's tool to the aimed surface. Both use
+    width, fading in where it comes from and running on a little past where
+    its way ends, fading out, so a run of several reads as one. An active pour
+    draws a cosmetic parabolic `PourArc` from the player's tool to the aimed
+    surface, faded in at the tool and out where it lands. Both use
     `vs_stream`/`fs_stream` in `water.wgsl`: streaks drawn out along the flow
     and carried down it at the water's speed, Fresnel sky reflection, sun
     specular, and white water on falls and along the edges.
@@ -271,7 +273,8 @@ to the terrain, but the player, sand and collision do not know it is there.
   main thread waits for it once its tick comes: one hitch, the first time.
 - Moving water is drawn level from side to side, so across a slope one edge
   of a sheet sinks into the ground and the other stands off it. Stretches of
-  a long run are separate pieces and the joins between them can be seen.
+  a long run are separate pieces, blended where one hands over to the next;
+  where the way turns sharply at a join, two pieces can still be seen.
 - The worst main-thread tick in the fly-through benchmark is up from 0.9 ms
   to 1.2–2.3 ms, cause not found.
 

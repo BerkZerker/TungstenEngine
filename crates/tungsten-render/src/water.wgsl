@@ -121,6 +121,7 @@ struct StreamIn {
     @location(2) normal: vec3<f32>,
     @location(3) foam: f32,
     @location(4) across: vec3<f32>,
+    @location(5) fade: f32,
 }
 
 struct StreamOut {
@@ -130,6 +131,7 @@ struct StreamOut {
     @location(2) along: f32,
     @location(3) foam: f32,
     @location(4) across: vec3<f32>,
+    @location(5) fade: f32,
 }
 
 @vertex
@@ -141,6 +143,7 @@ fn vs_stream(in: StreamIn) -> StreamOut {
     out.along = in.along;
     out.foam = in.foam;
     out.across = in.across;
+    out.fade = in.fade;
     return out;
 }
 
@@ -202,7 +205,7 @@ fn fs_stream(in: StreamOut) -> @location(0) vec4<f32> {
     // A jet thins towards its outline instead, whichever way it is seen from.
     let jet = smoothstep(0.0, 0.55, abs(dot(normalize(in.normal), v)));
     let side = mix(jet, sheet, in.across.z);
-    let alpha = clamp(0.62 + 0.3 * fresnel + 0.3 * white + sun.r, 0.0, 0.95) * side * contact;
+    let alpha = clamp(0.62 + 0.3 * fresnel + 0.3 * white + sun.r, 0.0, 0.95) * side * contact * in.fade;
     let fog = smoothstep(g.fog.x, g.fog.y, dist);
     return vec4<f32>(mix(color, g.fog_color.rgb, fog), alpha);
 }
