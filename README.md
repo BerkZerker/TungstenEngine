@@ -22,8 +22,9 @@ The first click captures the mouse; Esc releases it. The world is saved under
 | Shift | Run |
 | Ctrl | Crouch |
 | Left mouse (hold) | Break |
-| Right mouse (click) | Place the selected material |
+| Right mouse (click) | Place the selected material, or pour water |
 | 1 / 2 / 3 | Select stone / dirt / sand |
+| 4 | Select water |
 | Mouse wheel | Brush radius |
 | Space twice | Toggle fly mode (no collision; Space up, Ctrl down, Shift fast) |
 | V | Toggle vsync |
@@ -50,6 +51,14 @@ The world is a function: the terrain generator plus a log of every edit as a sha
 at five coarser levels, up to 8 m, out to the view distance, and an edit shows at
 every level. Only the log is saved. Sand stays where it is put for now.
 
+Water is a function too. The sea lies at 0 m wherever open ground is below it. A
+pond is a volume of water in a hollow: pour some with key 4 and right click, and
+it runs downhill to where it can lie. Dig a pond wider and it sinks, fill it in
+and it rises, dig through its rim and it runs on, into the next hollow or the
+sea; dig below 0 m beside the sea and the sea comes in. Water does not yet act
+on the player or on anything else. Ponds are saved in `water.bin` in the world's
+folder.
+
 Worlds are not kept compatible between versions of the engine yet. A world records
 the terrain generator it was made with and will not open after generation changes:
 start another with `--world NAME`, or remove its folder under `./worlds`.
@@ -71,9 +80,9 @@ tungsten --no-save --no-vsync --exit-after 10
 
 | Crate | Contents |
 |---|---|
-| `tungsten-core` | Deterministic core: generation, edit shapes, the edit log and its baking; plus mesher, raycast, collision geometry |
+| `tungsten-core` | Deterministic core: generation, edit shapes, the edit log and its baking, water; plus mesher, raycast, collision geometry |
 | `tungsten-stream` | Worker pool, the level-of-detail tree around the player, region files |
-| `tungsten-render` | wgpu renderer: terrain, brush outline, debug text |
+| `tungsten-render` | wgpu renderer: terrain, water, brush outline, debug text |
 | `tungsten-game` | The `tungsten` binary: window, input, player, HUD |
 
 ## Checks
@@ -85,10 +94,11 @@ cargo test --workspace
 ```
 
 `crates/tungsten-core/tests/golden.rs` pins hashes of generated terrain at every
-level, a scripted editing session, the same session resolved from its log, and
-the encoded saves. They must be identical on every platform; if a change to
-generation or to the edit rules is intended, bump `GENERATOR_VERSION` and
-update the constants from the failure message.
+level, a scripted editing session, the same session resolved from its log, the
+encoded saves, and a scripted session with water. They must be identical on
+every platform; if a change to generation or to the edit rules is intended, bump
+`GENERATOR_VERSION` and update the constants from the failure message. A change
+to how water behaves needs only its own constant updated.
 
 ## License
 

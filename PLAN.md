@@ -1,7 +1,7 @@
 # Tungsten Engine Plan
 
-Companion to `SPEC.md`. The first section describes the engine as it is now (v0.2).
-Sections 0 to 12 are the v0.1 plan, kept for the mechanics that have not changed
+Companion to `SPEC.md`. The first section describes the engine as it is now (v0.2),
+the second the first pass at water built on it. Sections 0 to 12 are the v0.1 plan, kept for the mechanics that have not changed
 (materials, meshing rules, the player, rendering, the determinism boundary). Where
 they disagree with the v0.2 section, v0.2 is what is built: in particular 4.1 (cell
 size), 4.2 and 9.3 (chunks and their lifecycle), 7.2 and 7.3 (how brushes are
@@ -94,6 +94,124 @@ next. Old worlds are not kept readable.
 - Collision and raycasts use level-0 samples, loaded within about 16 m of the
   player; flying faster than terrain loads is allowed, walking waits for it.
 - Sand does not move.
+
+## Water: first pass (2026-11-21, branch `water`)
+
+The idea from the user: water as a function, not a grid simulation. A body is a
+basin and a volume, its surface flat at the height the volume gives; the sea is
+a body with a fixed level and no end to its volume; edits change what is
+connected, found by a local flood at the time of the edit. For now water only
+fills space: it is drawn and it answers to the terrain, but the player, sand
+and collision do not know it is there.
+
+### How it works
+
+- **The sea** is a function of the generator: every column whose generated
+  ground is below 0 m is open sea, and so is anything hollow under such a
+  column below 0 m. It costs nothing to store and is drawn at every level.
+- **A pond** is a seed cell and a volume, in units of 1/256 of a base cell.
+  Where its water lies is worked out from those and the terrain: the hollow
+  around the seed is filled from the bottom one lattice layer at a time
+  (`water::flood::fill`), which gives the wet cells and the level. Lower
+  ground beyond a rim fills before the water rises further; if there is not
+  enough to fill it, the water parts at the rim. The cells are kept only as a
+  cache for drawing, and are worked out again whenever the terrain within
+  their bounds changes, so digging a pond wider lowers it and dropping sand in
+  raises it, with the volume untouched.
+- **Water on the move.** What a hollow cannot hold, and water poured by hand,
+  runs downhill: straight down, then along level ground to the nearest drop,
+  one 16 m box per tick. Where it comes to rest it becomes a pond; into a pond
+  it adds to it; into the sea it is gone (the sea does not rise). Ponds that
+  meet become one. Water that reaches terrain which is not loaded waits there.
+- **The sea through an opening.** Where an edit opens ground below 0 m beside
+  the sea, the sea spreads into it, a box per tick. The cells it has entered
+  are stored. A pond the sea reaches, or that is dug through to it below 0 m,
+  becomes part of it; above 0 m it drains into it down to its rim.
+- **Search boxes.** A flood looks at a 16 x 12 x 16 m box of level-0 samples
+  around its start and at most 120,000 cells. A pond that has outgrown the
+  box, or that the edge of the box held in, is filled in a 32 x 16 x 32 m box.
+- **Books.** Every unit poured is in a pond, on the move, drained to the sea,
+  or lost; the F3 overlay shows the four. Lost means: a pond of under 8 cells
+  (it soaks away), a pond buried whole by an edit, water let go inside solid
+  ground, water over what a closed space or the box holds to its top, or
+  water still looking for a place after overflowing 48 hollows in a row.
+- **Ticks.** All of it is integer arithmetic on the main thread, bounded per
+  tick: 4 ponds settled, one lot of moving water followed, 30,000 cells of sea
+  spread. Settling a pond was measured at 0.05 to 0.4 ms, in the wide box at
+  0.5 to 1.2 ms (but see the limits).
+- **Drawing.** Each node job is handed the water surfaces that pass through
+  the node: the wet columns of the surface layer, merged into rectangles on
+  the node's own lattice. A surface is drawn by the node under it, and its
+  height is given at draw time, so a level that moves needs no new mesh.
+  Water is drawn in a second pass, after the terrain, which also writes its
+  distance from the camera to an R32F attachment; the water shader reads it to
+  make shallows clear, deep water opaque, and the last 8 cm at a shore fade
+  out. Ripples are five summed sine waves that tile every 64 m.
+- **Saves.** `water.bin` beside the regions: ponds (seed, volume, level,
+  cells), the cells the sea has entered, and water on the move. The world
+  format is unchanged; a world without the file has no ponds.
+- **By hand.** Key 4 selects water; right click lets go a ball of it, of the
+  brush's size, 1.5 base cells above the point aimed at.
+
+### Status
+
+**Verified by running it**
+
+- 64 tests pass, 19 of them new; clippy is clean with warnings as errors.
+- A scripted session (dig, pour, dig a channel, fill in, pour more, at the
+  origin and at a shore, for two sets of world parameters) checks that every
+  unit poured is accounted for and pins the encoded state with a golden hash,
+  identical on ARM64 and on x86-64 (under Rosetta). The terrain hashes are
+  unchanged: the generator was not touched.
+- Tests in `tungsten-core`: volume gives level; a second hollow beyond a rim;
+  a hollow beside open ground; meeting another body; a pond keeping its volume
+  through digging and filling; overflow running downhill; two ponds becoming
+  one; a pit wider than the first box; the sea entering a dug channel; a pond
+  dug through to the sea. In `tungsten-stream`: the sea is drawn at the
+  coarser levels and a pond at the level it is seen at, follows an edit, and
+  is the same after a save and restart.
+- Benchmark, v0.2 and this branch built and run in turn on the same machine:
+  0.34 to 0.36 ms of main-thread time per tick on average for v0.2, 0.35 for
+  water; worst tick 0.9 to 1.2 ms for both; no tick spent waiting for terrain.
+  The benchmark has no ponds in it; settling one is timed above.
+- Headless captures: the sea from the shore and from 30 to 150 m up, out to
+  the fog; a pond in a dug pit from above, after a restart, after digging
+  beside it, and from 35 m at a coarser level; the sea entering a pit dug at
+  the waterline.
+
+**Not verified**
+
+- The window: only headless captures have run with water, so resizing (which
+  makes the distance attachment again) and how moving water looks at 60 Hz
+  are untested.
+- Long sessions with many ponds. Each node job looks through every pond.
+- Vulkan and DX12.
+
+**Not built**
+
+- Lakes in the generated terrain. Everything above 0 m is dry until water is
+  poured.
+- Streams and the surge. Overflow moves a box per tick but is not drawn on
+  the way: it leaves one place and appears in the next.
+- Any effect of water on the player, on sand, or on what is seen from under
+  it beyond a plain underside.
+
+**Known limits**
+
+- A hollow more than 32 m across is not one pond: its water goes round the
+  low places and is counted lost after 48 rounds. Water more than about 10 m
+  deep over its lowest point is lost as well.
+- Water does not split. A pond cut in two by a wall stays one body with one
+  level, filled from its seed's side; cells the sea has entered stay sea
+  when the opening is closed.
+- A cave that runs from under the sea to under land is dry on the land side
+  until an edit near it lets the sea in.
+- A wide pond that overflows onto open ground can search all 120,000 cells,
+  which was measured at 2.8 ms on the tick it settles: over the 2 ms budget.
+  Settling belongs on the worker pool.
+- Levels change at once; there is no easing.
+- Where the ground under a surface is thinner than a coarse cell the far
+  shoreline is as blocky as the level it is drawn at.
 
 ## 0. v0.1 status (2026-11-21, historical)
 
