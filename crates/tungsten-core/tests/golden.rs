@@ -18,10 +18,10 @@ use tungsten_core::worldgen::{GENERATOR_VERSION, Generator};
 use tungsten_core::{MAX_LEVEL, NodeKey, Volume, WorldParams};
 
 const GENERATED: u64 = 0xf80a0bb91e1930b0;
-const EDITED: u64 = 0x37c3dd5efb1f4d93;
-const RESOLVED: u64 = 0x88b617e9558fa8d1;
-const SAVED: u64 = 0x6fabf7af924c70be;
-const BAKED: u64 = 0xff72da7184c9c3d7;
+const EDITED: u64 = 0x05c7725beb7c0b7f;
+const RESOLVED: u64 = 0x9126b43589a2934f;
+const SAVED: u64 = 0x419dcb1ebe6f224e;
+const BAKED: u64 = 0xe240962c290a1032;
 const WATER: u64 = 0x8cf5fe850ad536ce;
 
 fn worlds() -> [WorldParams; 2] {
@@ -110,6 +110,7 @@ fn generation_edits_and_saves_match_golden_hashes() {
             let op = match k % 6 {
                 0..=2 => Op::Break { center: c, radius: 4 * FP + (k % 5) * 90, nearest: false },
                 3 => Op::Break { center: c, radius: 3 * FP, nearest: true },
+                4 if k % 4 == 0 => Op::Chip { center: c },
                 _ => Op::Place { center: c, radius: 5 * FP, material: (k % 3) as u8 + 1, exclude: None },
             };
             let outcome = edit_volume(&mut volume, &rules, &op);

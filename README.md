@@ -21,7 +21,7 @@ The first click captures the mouse; Esc releases it. The world is saved under
 | Space | Jump |
 | Shift | Run |
 | Ctrl | Crouch |
-| Left mouse (hold) | Break |
+| Left mouse (hold) | Break. Stone chips, then gives way a shard at a time |
 | Right mouse (click) | Place the selected material, or pour water |
 | 1 / 2 / 3 | Select stone / dirt / sand |
 | 4 | Select water |
