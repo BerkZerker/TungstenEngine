@@ -16,7 +16,7 @@ use crate::terrain::{aabb_visible, frustum_planes};
 /// Exponential ease rate (per second) for cosmetic client-side level transitions.
 const LEVEL_EASE_RATE: f64 = 5.5;
 /// Cross-section sides of extruded flowing streams and pour arcs.
-const STREAM_SIDES: usize = 10;
+const STREAM_SIDES: usize = 12;
 
 /// Active pour stream from the player's tool to the aimed surface, purely cosmetic.
 #[derive(Clone, Copy, Debug)]
@@ -36,6 +36,9 @@ struct StreamVertex {
     along: f32,
     normal: [f32; 3],
     foam: f32,
+    /// Across the flow: metres from its middle, that as a share of its half
+    /// width, and how far it is a sheet on the ground and not a jet, 0 to 1.
+    across: [f32; 3],
 }
 
 struct PatchGpu {
@@ -186,7 +189,7 @@ impl Water {
                 buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: size_of::<StreamVertex>() as u64,
                     step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32, 2 => Float32x3, 3 => Float32],
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32, 2 => Float32x3, 3 => Float32, 4 => Float32x3],
                 })],
             },
             primitive: wgpu::PrimitiveState {
@@ -544,7 +547,9 @@ fn append_stream(
         return;
     }
     let smoothed = smooth_polyline(&clipped, (cell_size * 1.6).max(0.35));
-    let base_r = (0.10 + 0.08 * stream.rate.max(0.05).powf(0.40)).clamp(0.10, 0.50);
+    // Half the width of the water, from cubic metres a second of it.
+    let rate = stream.rate * cell_size.powi(3) * 60.0;
+    let base_r = (0.2 * rate.max(0.0).sqrt()).clamp(0.1, 0.8);
     let pad = Vec3::splat(base_r * 1.8);
     let (mut min, mut max) = (smoothed[0].0, smoothed[0].0);
     for &(p, _) in &smoothed {
@@ -557,18 +562,24 @@ fn append_stream(
     let s_start = smoothed.first().unwrap().1;
     let s_end = smoothed.last().unwrap().1;
     let total_len = (s_end - s_start).max(1e-3);
-    let taper_dist = (0.35f32).min(total_len * 0.25);
+    let taper_dist = (1.5 * base_r).max(0.3).min(total_len * 0.5);
+    // The water narrows to its front and its tail, not where it comes from
+    // or where the way ends: there it runs on into other water.
+    let length = stream.along.last().copied().unwrap_or(0.0);
+    let (source, arrived) = (stream.from <= 0.01, stream.to >= length - 0.01);
     extrude_tube(
         &smoothed,
         |i, tangent| {
             let s = smoothed[i].1;
-            let end_taper = ((s - s_start) / taper_dist).min((s_end - s) / taper_dist).clamp(0.20, 1.0);
+            let tail = if source { 1.0 } else { (s - s_start) / taper_dist };
+            let front = if arrived { 1.0 } else { (s_end - s) / taper_dist };
+            let end_taper = tail.min(front).clamp(0.04, 1.0).sqrt();
             let steep = tangent.y.abs();
-            // On slopes, a wide shallow ribbon hugging the terrain; on steep drops, a rounded column.
-            let rx = base_r * (1.35 - 0.55 * steep) * end_taper;
-            let ry = base_r * (0.28 + 0.52 * steep) * end_taper;
-            let foam = (0.10 + 0.65 * steep).clamp(0.10, 0.75);
-            (rx, ry, 0.0, foam)
+            // On slopes, a wide shallow sheet lying on the ground; on steep drops, a rounded column.
+            let rx = base_r * (1.0 - 0.6 * steep) * end_taper;
+            let ry = (0.05 + (base_r * 0.4 - 0.05) * steep) * end_taper;
+            let foam = (0.15 + 0.85 * steep).clamp(0.15, 1.0);
+            (rx, ry, ry * 0.5, foam, 1.0 - steep)
         },
         vertices,
         indices,
@@ -621,7 +632,7 @@ fn append_pour_arc(
             let t = i as f32 / SEGMENTS as f32;
             let r = base_r * (0.55 + 0.70 * t);
             let foam = 0.45 + 0.35 * t;
-            (r, r, 0.0, foam)
+            (r, r, 0.0, foam, 0.0)
         },
         vertices,
         indices,
@@ -629,10 +640,10 @@ fn append_pour_arc(
 }
 
 /// Extrude a closed `STREAM_SIDES`-sided tube along `pts` using a stable
-/// transport frame. `profile(i, tangent)` returns `(rx, ry, y_shift, foam)`.
+/// transport frame. `profile(i, tangent)` returns `(rx, ry, y_shift, foam, flat)`.
 fn extrude_tube(
     pts: &[(Vec3, f32)],
-    profile: impl Fn(usize, Vec3) -> (f32, f32, f32, f32),
+    profile: impl Fn(usize, Vec3) -> (f32, f32, f32, f32, f32),
     vertices: &mut Vec<StreamVertex>,
     indices: &mut Vec<u32>,
 ) {
@@ -662,7 +673,7 @@ fn extrude_tube(
         let up = right.cross(tangent).normalize_or(Vec3::Y);
         prev_right = right;
 
-        let (rx, ry, y_shift, foam) = profile(i, tangent);
+        let (rx, ry, y_shift, foam, flat) = profile(i, tangent);
         let center = pts[i].0 + Vec3::Y * y_shift;
         let along = pts[i].1;
         for s in 0..STREAM_SIDES {
@@ -670,7 +681,14 @@ fn extrude_tube(
             let (sin, cos) = ang.sin_cos();
             let offset = right * (cos * rx) + up * (sin * ry);
             let normal = (right * (cos / rx.max(1e-4)) + up * (sin / ry.max(1e-4))).normalize_or(Vec3::Y);
-            vertices.push(StreamVertex { pos: (center + offset).to_array(), along, normal: normal.to_array(), foam });
+            let across = [cos * rx, cos, flat];
+            vertices.push(StreamVertex {
+                pos: (center + offset).to_array(),
+                along,
+                normal: normal.to_array(),
+                foam,
+                across,
+            });
         }
     }
     let stride = STREAM_SIDES as u32;
@@ -683,32 +701,5 @@ fn extrude_tube(
             indices.extend_from_slice(&[a + s, b + next, a + next, a + s, b + s, b + next]);
         }
     }
-    // Cap both ends so neither the nozzle nor a splash tip looks hollow.
-    let start_tip = vertices.len() as u32;
-    let t0 = (pts[1].0 - pts[0].0).normalize_or(Vec3::NEG_Y);
-    let (_, _, y0, f0) = profile(0, t0);
-    vertices.push(StreamVertex {
-        pos: (pts[0].0 + Vec3::Y * y0).to_array(),
-        along: pts[0].1,
-        normal: (-t0).to_array(),
-        foam: f0,
-    });
-    for s in 0..stride {
-        let next = (s + 1) % stride;
-        indices.extend_from_slice(&[start_tip, base + s, base + next]);
-    }
-    let end_tip = vertices.len() as u32;
-    let tn = (pts[n - 1].0 - pts[n - 2].0).normalize_or(Vec3::NEG_Y);
-    let (_, _, yn, fn_) = profile(n - 1, tn);
-    let last_ring = base + (n as u32 - 1) * stride;
-    vertices.push(StreamVertex {
-        pos: (pts[n - 1].0 + Vec3::Y * yn).to_array(),
-        along: pts[n - 1].1,
-        normal: tn.to_array(),
-        foam: fn_,
-    });
-    for s in 0..stride {
-        let next = (s + 1) % stride;
-        indices.extend_from_slice(&[end_tip, last_ring + next, last_ring + s]);
-    }
+    // The ends are left open: they are drawn out thin, or run into other water.
 }

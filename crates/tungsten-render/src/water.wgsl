@@ -112,11 +112,17 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
 
 // Moving water: pouring arcs and downhill streams.
 
+// Must match `SPEED` of tungsten-core's water at the default cell size:
+// the pattern is carried along at the speed the water runs.
+const STREAM_SPEED: f32 = 5.6;
+const SHALLOW: vec3<f32> = vec3<f32>(0.020, 0.085, 0.200);
+
 struct StreamIn {
     @location(0) pos: vec3<f32>,
     @location(1) along: f32,
     @location(2) normal: vec3<f32>,
     @location(3) foam: f32,
+    @location(4) across: vec3<f32>,
 }
 
 struct StreamOut {
@@ -125,6 +131,7 @@ struct StreamOut {
     @location(1) normal: vec3<f32>,
     @location(2) along: f32,
     @location(3) foam: f32,
+    @location(4) across: vec3<f32>,
 }
 
 @vertex
@@ -135,7 +142,24 @@ fn vs_stream(in: StreamIn) -> StreamOut {
     out.normal = in.normal;
     out.along = in.along;
     out.foam = in.foam;
+    out.across = in.across;
     return out;
+}
+
+fn hash(p: vec2<f32>) -> f32 {
+    var q = fract(vec3<f32>(p.x, p.y, p.x) * 0.1031);
+    q += dot(q, q.yzx + 33.33);
+    return fract((q.x + q.y) * q.z);
+}
+
+// Smooth noise in 0..1, one feature per unit.
+fn noise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    let a = mix(hash(i), hash(i + vec2<f32>(1.0, 0.0)), u.x);
+    let b = mix(hash(i + vec2<f32>(0.0, 1.0)), hash(i + vec2<f32>(1.0, 1.0)), u.x);
+    return mix(a, b, u.y);
 }
 
 @fragment
@@ -143,16 +167,14 @@ fn fs_stream(in: StreamOut) -> @location(0) vec4<f32> {
     let to_camera = g.camera.xyz - in.world;
     let dist = length(to_camera);
     let v = to_camera / max(dist, 1e-4);
-    let t = g.water.z;
 
-    // Downstream-scrolling ripples and aerated streaks.
-    let flow = in.along * 6.0 - t * 18.0;
-    let cross = (in.world.x + in.world.z) * 5.0;
-    let w1 = sin(flow + sin(cross) * 0.9);
-    let w2 = sin(in.along * 11.0 - t * 28.0 - cross * 1.4);
-    let w3 = sin(in.along * 3.5 - t * 11.0 + in.world.y * 5.0);
-    let perturb = vec3<f32>(w1 * 0.065 + w2 * 0.035, w3 * 0.03, w2 * 0.065 - w1 * 0.035);
-    var n = normalize(in.normal + perturb / (1.0 + dist * dist / 4000.0));
+    // Streaks drawn out along the flow and carried down it.
+    let run = in.along - g.water.z * STREAM_SPEED;
+    let a = noise(vec2<f32>(in.across.x * 13.0, run * 0.6));
+    let b = noise(vec2<f32>(in.across.x * 37.0 + 7.3, run * 1.7 + a));
+    let streak = a * 0.6 + b * 0.4;
+    let rough = vec3<f32>(a - 0.5, 0.0, b - 0.5) * 0.45 / (1.0 + dist * dist / 4000.0);
+    var n = normalize(in.normal + rough);
     if (dot(n, v) < 0.0) {
         n = -n;
     }
@@ -161,20 +183,28 @@ fn fs_stream(in: StreamOut) -> @location(0) vec4<f32> {
     let r = reflect(-v, n);
     let zenith = g.fog_color.rgb * vec3<f32>(0.42, 0.60, 0.92);
     let sky = mix(g.fog_color.rgb, zenith, sqrt(clamp(r.y, 0.0, 1.0)));
-    let sun = g.sun_color.rgb * pow(max(dot(r, g.sun_dir.xyz), 0.0), 260.0) * 2.8;
-    let body = DEEP * (1.4 + 2.2 * max(g.sun_dir.y, 0.0));
+    let sun = g.sun_color.rgb * pow(max(dot(r, g.sun_dir.xyz), 0.0), 260.0) * 2.0;
+    let body = SHALLOW * (0.5 + 1.5 * max(g.sun_dir.y, 0.0));
 
-    // Whitewater streaks on falls, steep slopes, and the pouring jet.
-    let streak = smoothstep(0.25, 0.95, 0.45 + 0.35 * w1 + 0.25 * w2 + 0.2 * w3);
-    let white = clamp(in.foam * (0.18 + 0.48 * streak), 0.0, 0.62);
-    let foam_col = mix(g.fog_color.rgb, vec3<f32>(0.90, 0.95, 0.99), 0.72);
-    let water_col = mix(body, sky, fresnel) + sun;
-    let color = mix(water_col, foam_col, white);
+    // White water: in streaks where it is steep, and along the edges of
+    // water on the ground.
+    let edge = abs(in.across.y);
+    let torn = in.foam * smoothstep(0.5, 0.8, streak);
+    let fringe = in.across.z * smoothstep(0.5, 0.95, edge) * smoothstep(0.35, 0.7, b) * 0.4;
+    let white = clamp(torn + fringe, 0.0, 0.9);
+    let foam_col = mix(g.fog_color.rgb, vec3<f32>(0.90, 0.95, 0.99), 0.75);
+    let color = mix(mix(body, sky, fresnel) + sun, foam_col, white);
 
+    // Thin towards its edges and where the ground comes up through it, so
+    // that it lies on the ground instead of standing on it.
     let ground = textureLoad(terrain_distance, vec2<i32>(in.clip.xy), 0).r;
     let through = max(ground - dist, 0.0);
-    let contact = smoothstep(0.0, 0.04, through);
-    let alpha = clamp(0.56 + 0.34 * fresnel + 0.25 * white + sun.r, 0.0, 0.94) * max(contact, 0.45);
+    let contact = smoothstep(0.0, 0.05, through);
+    let sheet = 1.0 - smoothstep(0.72, 1.0, edge);
+    // A jet thins towards its outline instead, whichever way it is seen from.
+    let jet = smoothstep(0.0, 0.55, abs(dot(normalize(in.normal), v)));
+    let side = mix(jet, sheet, in.across.z);
+    let alpha = clamp(0.62 + 0.3 * fresnel + 0.3 * white + sun.r, 0.0, 0.95) * side * contact;
     let fog = smoothstep(g.fog.x, g.fog.y, dist);
     return vec4<f32>(mix(color, g.fog_color.rgb, fog), alpha);
 }

@@ -339,7 +339,9 @@ impl Game {
         }
         if self.pouring && (input.place_held || clicks > 0) {
             // Holding right click pours a steady flow at a rate set by the brush size.
-            let at = hit.pos + (hit.normal * 1.5).as_dvec3();
+            // Let go in the first open cell over the surface: from any higher
+            // it would fall there as a column of its own.
+            let at = hit.pos + (hit.normal * 0.6).as_dvec3();
             let r = self.brush_radius as f64 / cell;
             let rate = (r * r * 30.0).round().max(1.0) as i64;
             let mult = if input.place_held { 1 } else { clicks as i64 };
@@ -402,7 +404,7 @@ impl Game {
         let (sy, cy) = self.player.yaw.sin_cos();
         let right = DVec3::new(cy as f64, 0.0, sy as f64);
         let up = right.cross(forward).normalize_or(DVec3::Y);
-        let from = eye + forward * 0.18 + right * 0.25 - up * 0.28;
+        let from = eye + forward * 0.4 + right * 0.3 - up * 0.35;
         let to = (hit.pos + (hit.normal * 0.5).as_dvec3()) * cell;
         Some(PourArc { from, to, radius: self.brush_radius })
     }

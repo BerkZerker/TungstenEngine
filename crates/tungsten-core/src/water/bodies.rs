@@ -1167,6 +1167,7 @@ mod tests {
     use crate::field::LocalField;
     use crate::log::EditLog;
     use crate::material::Material;
+    use crate::water::job::{KeptTerrain, Made};
     use crate::worldgen::SEA_LEVEL;
     use std::sync::Arc;
 
@@ -1180,7 +1181,8 @@ mod tests {
         /// Terrain that is a rule instead of the generator's: true where solid.
         solid: Option<Box<dyn Fn(IVec3) -> bool>>,
         water: Water,
-        found: Option<(u64, Outcome)>,
+        kept: KeptTerrain,
+        found: Option<(u64, Outcome, Vec<Made>)>,
         tick: u64,
         poured: i64,
     }
@@ -1195,6 +1197,7 @@ mod tests {
                 log: EditLog::new(),
                 solid,
                 water: Water::new(),
+                kept: KeptTerrain::default(),
                 found: None,
                 tick: 0,
                 poured: 0,
@@ -1231,8 +1234,10 @@ mod tests {
             self.tick += 1;
             let (volume, log, solid, tick) = (&self.volume, &self.log, &self.solid, self.tick);
             let mut found = self.found.take();
+            self.kept.tick();
+            let kept = std::cell::RefCell::new(&mut self.kept);
             let terrain = |request: &Request| match solid {
-                None => Terrain::gather(volume, log, request),
+                None => kept.borrow_mut().gather(volume, log, request),
                 Some(solid) => {
                     let mut chunks = Vec::new();
                     for i in 0..request.size.element_product() {
@@ -1254,15 +1259,18 @@ mod tests {
             };
             // What a search found is asked for exactly `DELAY` ticks after it was started.
             let outcome = || {
-                let (started, outcome) = found.take().expect("no search was under way");
+                let (started, outcome, made) = found.take().expect("no search was under way");
                 assert_eq!(tick, started + DELAY);
+                kept.borrow_mut().store(made);
                 outcome
             };
             let job = self.water.step(outcome, terrain);
             assert!(found.is_none() || job.is_none());
             self.found = found;
             if let Some(job) = job {
-                self.found = Some((self.tick, job.run(&self.generator, &self.rules)));
+                self.kept.launched();
+                let (outcome, made) = job.run_keeping(&self.generator, &self.rules);
+                self.found = Some((self.tick, outcome, made));
             }
             assert_eq!(self.total(), self.poured, "water was made or lost at tick {}", self.tick);
         }
@@ -1276,6 +1284,7 @@ mod tests {
             let outcome = edit_volume(&mut self.volume, &self.rules, &op);
             assert!(outcome.covered);
             self.log.push(&self.rules, &op);
+            self.kept.edited(&self.rules, &op);
             if let Some((min, max)) = outcome.changed {
                 self.water.edited(&self.volume, &self.generator, min, max);
             }
@@ -1501,7 +1510,16 @@ mod tests {
             );
             if lod == 0 {
                 world.check(&pond);
+                continue;
             }
+            // Dug wider, it is searched again in terrain kept from before,
+            // and what was dug is under the water.
+            let edge = IVec3::new(here.x + across / 2 * 14, floor, here.z);
+            world.dig(edge, 10);
+            world.rest();
+            assert_eq!(world.water.stats().held, poured, "{:?}", world.water.stats());
+            let (_, pond) = world.ponds().into_iter().max_by_key(|(_, p)| p.volume).unwrap();
+            assert!(pond.span.unwrap().1.x >= edge.x, "{:?} with the bowl at {edge}", pond.span);
         }
     }
 

@@ -9,7 +9,7 @@ use tungsten_core::hash::{IntMap, IntSet};
 use tungsten_core::log::{self, Baked, CellEdits, CellPos, CellSet, EditLog, TIERS};
 use tungsten_core::mesh::{ChunkMesh, mesh_block};
 use tungsten_core::water::bodies::{JOIN, Water};
-use tungsten_core::water::job::{Outcome, Request, Terrain, WaterJob};
+use tungsten_core::water::job::{KeptTerrain, Made, Outcome, Request, WaterJob};
 use tungsten_core::water::{self, NodeWater};
 use tungsten_core::worldgen::{Generated, Generator};
 use tungsten_core::{Chunk, ChunkPos, Volume, WorldParams};
@@ -160,8 +160,11 @@ pub struct World {
     done: Receiver<Done>,
     /// Results of edit remeshes, kept apart so streaming cannot delay them.
     done_urgent: Receiver<Done>,
-    /// Outcome of the in-flight water search, awaited at its fixed tick.
-    done_water: Receiver<Outcome>,
+    /// Outcome of the in-flight water search, awaited at its fixed tick, and
+    /// the chunks it had to make.
+    done_water: Receiver<(Outcome, Vec<Made>)>,
+    /// Terrain made for water searches where none is loaded.
+    water_terrain: KeptTerrain,
     /// Focus in base cells, as of the last look at the tree.
     focus: Option<DVec3>,
     groups: IntMap<u32, Group>,
@@ -239,7 +242,7 @@ impl World {
         let rules = EditRules::new(&params);
         let (tx, done): (Sender<Done>, _) = unbounded();
         let (tx_urgent, done_urgent): (Sender<Done>, _) = unbounded();
-        let (tx_water, done_water): (Sender<Outcome>, _) = unbounded();
+        let (tx_water, done_water): (Sender<(Outcome, Vec<Made>)>, _) = unbounded();
         let worker_gen = generator.clone();
         let pool = Pool::new(config.workers, move |job: Job| {
             let result = match job {
@@ -248,7 +251,7 @@ impl World {
                     return;
                 }
                 Job::Water(job) => {
-                    let _ = tx_water.send(job.run(&worker_gen, &rules));
+                    let _ = tx_water.send(job.run_keeping(&worker_gen, &rules));
                     return;
                 }
                 Job::Node { key, version, group, cells, water } => {
@@ -310,6 +313,7 @@ impl World {
             done,
             done_urgent,
             done_water,
+            water_terrain: KeptTerrain::default(),
             focus: None,
             groups: IntMap::default(),
             next_group: 1,
@@ -712,8 +716,10 @@ impl World {
             return outcome;
         }
         self.log.push(&self.rules, op);
+        self.water_terrain.edited(&self.rules, op);
         if let Some(fragments) = &outcome.fragments {
             self.log.push(&self.rules, fragments);
+            self.water_terrain.edited(&self.rules, fragments);
         }
 
         // Notify water of the terrain change; settling runs on workers on the
@@ -799,10 +805,17 @@ impl World {
     /// outcomes are applied at a fixed tick delay; if a worker has not finished
     /// when its tick arrives, this waits so every machine stays identical.
     pub fn step_water(&mut self) {
+        self.water_terrain.tick();
         let (volume, log, store, regions, done_water) =
             (&self.volume, &mut self.log, &self.store, &mut self.regions, &self.done_water);
+        // Both closures use the kept terrain, one after the other.
+        let kept = std::cell::RefCell::new(&mut self.water_terrain);
         let job = self.water.step(
-            || done_water.recv().expect("water worker exited"),
+            || {
+                let (outcome, made) = done_water.recv().expect("water worker exited");
+                kept.borrow_mut().store(made);
+                outcome
+            },
             |req: &Request| {
                 if !req.loaded {
                     let step = 1 << req.lod;
@@ -810,10 +823,11 @@ impl World {
                     let max = ((req.origin + req.size) * CHUNK_SIZE + APRON) * step;
                     load_regions(store.as_deref(), log, regions, CellPos::tier_of(req.lod), min, max);
                 }
-                Terrain::gather(volume, log, req)
+                kept.borrow_mut().gather(volume, log, req)
             },
         );
         if let Some(job) = job {
+            self.water_terrain.launched();
             self.pool.push(URGENT, Job::Water(job));
         }
         self.redraw_water(&mut IntSet::default());

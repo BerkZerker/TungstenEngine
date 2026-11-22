@@ -107,7 +107,7 @@ next. Old worlds are not kept readable.
   player; flying faster than terrain loads is allowed, walking waits for it.
 - Sand does not move.
 
-## Water (2026-11-21, second pass on branch `gemini-water`)
+## Water (2026-11-22)
 
 The idea from the user: water as a function, not a grid simulation. A body is a
 basin and a volume, its surface flat at the height the volume gives; the sea is
@@ -162,6 +162,14 @@ to the terrain, but the player, sand and collision do not know it is there.
   `T + DELAY` (`DELAY = 4`); if the worker is not done yet, the main thread
   waits rather than applying it late, preserving bit-exact determinism across
   machines and thread counts while keeping settling off the main thread.
+  Where no terrain is loaded (coarse levels, or far from the player) a search
+  makes its chunks from the generator and the log, which costs far more than
+  the search does (about 12 ms a chunk under a few hundred ops). Those chunks
+  are kept (`water::job::KeptTerrain`) and later edits are applied to them
+  one by one, so a pond that settles over many searches pays for its terrain
+  once. An op changes each sample from its position and what was there, so a
+  kept chunk brought up to date is the chunk made afresh; two tests hold it
+  to that.
 - **Drawing.**
   - *Flat surfaces:* each node job is handed the water surfaces that pass
     through the node, merging overlapping masks per body (e.g., a sinking pond
@@ -171,12 +179,16 @@ to the terrain, but the player, sand and collision do not know it is there.
     each pond's drawn surface height toward its true integer level so ponds
     rise and sink smoothly instead of jumping.
   - *Moving water:* active `Flow` stretches (`Water::streams_at(alpha)`,
-    sub-tick interpolated client-side) are resampled and smoothed into
-    continuous 3D stream ribbons/waterfalls, and an active pour draws a
-    cosmetic parabolic `PourArc` from the player's tool to the aimed surface.
-    Both use `vs_stream`/`fs_stream` in `water.wgsl` with downstream-scrolling
-    ripples, Fresnel sky reflection, sun specular, and aerated whitewater
-    streaks on steep falls.
+    sub-tick interpolated client-side) are resampled and smoothed, then drawn
+    as a thin sheet lying on the ground, as wide as the rate of flow makes it
+    (0.2 m to 1.6 m), rounding into a column where it falls. A sheet thins to
+    nothing at its edges, where the ground comes up through it, and at its
+    front and its tail; where one stretch hands over to the next it keeps its
+    width, so a run of several reads as one. An active pour draws a cosmetic
+    parabolic `PourArc` from the player's tool to the aimed surface. Both use
+    `vs_stream`/`fs_stream` in `water.wgsl`: streaks drawn out along the flow
+    and carried down it at the water's speed, Fresnel sky reflection, sun
+    specular, and white water on falls and along the edges.
   - *Single-pass fast path:* when no water patches, streams, or pour arcs are
     visible in the frustum, terrain, lines, and text render in one MSAA pass
     (`fs_plain`, skipping the R32F distance attachment and second pass). When
@@ -187,15 +199,19 @@ to the terrain, but the player, sand and collision do not know it is there.
   (including any in-flight sea seeds), and active flows with their in-transit
   lots. Saving mid-flow loses no water.
 - **By hand.** Key 4 selects water; holding right click pours a steady flow at
-  a rate scaled by brush radius squared (replacing the single-click ball).
+  a rate scaled by brush radius squared (replacing the single-click ball):
+  4 m3/s at the default 1.5 m. It is let go in the first open cell over the
+  surface aimed at.
 
 ### Status
 
 **Verified by running it**
 
-- 76 tests pass (including 27 water-related tests across `tungsten-core` and
-  `tungsten-stream` plus worker-thread-count determinism); clippy is clean with
-  warnings as errors; `cargo fmt --all --check` passes.
+- 78 tests pass (31 of them on water, in `tungsten-core` and
+  `tungsten-stream`, one of which is worker-thread-count determinism); clippy
+  is clean with warnings as errors; `cargo fmt --all --check` passes. The
+  core tests take 5 s (the wide-hollow test alone took 93 s before searches
+  kept their terrain).
 - Golden hashes: terrain hashes (`GENERATED`, `EDITED`, `RESOLVED`, `SAVED`,
   `BAKED`) match `main` unchanged; the updated `WATER` golden hash
   (`0x74d645c02f86d0ff`) is identical on ARM64 and on x86-64 (under Rosetta).
@@ -207,22 +223,26 @@ to the terrain, but the player, sand and collision do not know it is there.
   soak-away (<8 cells) only when unfed; mid-flow save/reload conservation;
   sea advancing in steps through a dug channel; and identical water state at 1
   vs 4 worker threads.
-- Benchmark (`--bench 10`, three runs on Apple M6): cold load 3,400 nodes /
-  4.03M triangles in 0.23–0.25 s; 60 m/s fly-through 0.315–0.364 ms average per
-  tick, 1.233–1.399 ms worst (zero over-budget ticks, zero ticks waiting for
-  terrain).
+- Benchmark (`--bench 10`, Apple M6, 2026-11-22, with the build before water's
+  second pass run alongside on the same machine): cold load 3,400 nodes /
+  4.03M triangles in 0.52 s (0.46 s before: the sea's reach is worked out per
+  256 m tile); 60 m/s fly-through 0.37–0.39 ms average per tick (0.35 before),
+  worst 1.2, 1.3 and 2.3 ms over three runs (0.8 and 0.9 before), no ticks
+  waiting for terrain.
 - Windowed frame rate at 3024 x 1800 (`--no-vsync --exit-after 4`, Apple M6
-  Metal): ~955 fps (worst frame 2.17 ms) looking inland with no water in view
-  (single-pass fast path), ~558–624 fps looking across the sea (two-pass path).
-- Headless captures (1280 x 720, all HUD lines fitting within 1280 px):
-  mid-pour parabolic arc + filling bowl; overflow stream running smoothly down
-  a hillside; sea entering a dug beach channel; pond widening/sinking over its
-  ebb footprint.
+  Metal) from the spawn point, the sea in view: 398–405 fps, against 403–409
+  for the build before the second pass in alternating runs.
+- Headless captures: a held pour as a jet and a sheet running down to the
+  shore; the same water all reaching the sea (`to sea` equal to what was
+  poured); a pit filling to its rim and the rest running on.
 
 **Not verified**
 
 - Interactive hand feel at 60+ Hz (driven only by scripted captures and timed
   window runs).
+- By eye: the sea coming in through a dug channel, a pond splitting at a dam,
+  and levels easing. Tests cover what the water does there; no capture of
+  this build shows how it looks.
 - Long sessions with many simultaneous ponds and flows.
 - Vulkan and DX12 (only Metal has run).
 
@@ -246,6 +266,14 @@ to the terrain, but the player, sand and collision do not know it is there.
 - Only one `WaterJob` runs at a time in round-robin order (`Settle`, `Route`,
   `Sea`) to keep tick-delay ordering simple; heavy simultaneous activity
   queues behind the 4-tick cadence.
+- The first search of a pond on a coarse lattice makes 32 chunks from the
+  log. Over ground with hundreds of edits that took 0.39 s in a test, and the
+  main thread waits for it once its tick comes: one hitch, the first time.
+- Moving water is drawn level from side to side, so across a slope one edge
+  of a sheet sinks into the ground and the other stands off it. Stretches of
+  a long run are separate pieces and the joins between them can be seen.
+- The worst main-thread tick in the fly-through benchmark is up from 0.9 ms
+  to 1.2–2.3 ms, cause not found.
 
 ## 0. v0.1 status (2026-11-21, historical)
 
