@@ -63,9 +63,17 @@ impl Grid {
     /// Size of the box a flood is searched in: 16 m by 12 m at the default cell size.
     pub const DIMS: IVec3 = IVec3::new(64, 48, 64);
 
+    /// A wider box, for a hollow the first is too small for: 32 m by 16 m.
+    pub const WIDE: IVec3 = IVec3::new(128, 64, 128);
+
     /// The search box for water at `p`: centred on it, with more room above than below.
     pub fn around(p: IVec3) -> IVec3 {
-        p - IVec3::new(Self::DIMS.x / 2, Self::DIMS.y / 3, Self::DIMS.z / 2)
+        Self::centred(p, Self::DIMS)
+    }
+
+    /// The origin of a box of size `dims` placed as [`around`](Self::around) places one.
+    pub fn centred(p: IVec3, dims: IVec3) -> IVec3 {
+        p - IVec3::new(dims.x / 2, dims.y / 3, dims.z / 2)
     }
 
     /// Copy a box out of the loaded world. `None` if part of it is not loaded.
@@ -154,7 +162,8 @@ pub enum Filled {
 }
 
 /// Fill the hollow around `seed` with `volume` of water, lowest cells first.
-/// Returns the cells that end up wet and how it ended.
+/// Returns the cells that end up wet, how it ended, and whether the edge of
+/// the box had a part in that, so that a wider box might find otherwise.
 ///
 /// The search goes up one layer at a time. Reaching layer `k` opens every
 /// cell that can be got to without going above it, including lower ground
@@ -162,7 +171,7 @@ pub enum Filled {
 /// there is not enough to fill it, the water this side of the rim stays
 /// level with it and the rest runs over, to be another body. Ground that
 /// goes on down past the box takes everything above the rim.
-pub fn fill(grid: &Grid, seed: IVec3, volume: i64) -> (Vec<IVec3>, Filled) {
+pub fn fill(grid: &Grid, seed: IVec3, volume: i64) -> (Vec<IVec3>, Filled, bool) {
     debug_assert!(grid.is_free(seed) && volume > 0);
     // For each cell found, one more than the index of the layer that opens it.
     let mut seen = vec![0u8; grid.cells.len()];
@@ -178,6 +187,7 @@ pub fn fill(grid: &Grid, seed: IVec3, volume: i64) -> (Vec<IVec3>, Filled) {
     let point = |i: u32| grid.point(i as usize);
     // Cells that are wet whatever happens next: every one is full.
     let mut wet: Vec<IVec3> = Vec::new();
+    let mut edge = false;
 
     for k in seed.y..grid.origin.y + grid.dims.y {
         // Everything wet so far is below this layer, and full.
@@ -187,7 +197,7 @@ pub fn fill(grid: &Grid, seed: IVec3, volume: i64) -> (Vec<IVec3>, Filled) {
         order.append(&mut waiting[(k - grid.origin.y) as usize]);
         if order.len() == opened {
             // A closed space, full to its roof.
-            return (wet, Filled::Spilled { level, kept, at: None });
+            return (wet, Filled::Spilled { level, kept, at: None }, edge);
         }
         let (mut cut_short, mut met) = (false, None);
         let mut next = opened;
@@ -197,6 +207,7 @@ pub fn fill(grid: &Grid, seed: IVec3, volume: i64) -> (Vec<IVec3>, Filled) {
             for d in NEIGHBOURS {
                 let q = p + d;
                 if !grid.inside(q) {
+                    edge |= q.y <= k;
                     continue;
                 }
                 let j = grid.index(q);
@@ -220,7 +231,7 @@ pub fn fill(grid: &Grid, seed: IVec3, volume: i64) -> (Vec<IVec3>, Filled) {
             }
         }
         if let Some(with) = met {
-            return (wet, Filled::Met { level, kept, with });
+            return (wet, Filled::Met { level, kept, with }, edge);
         }
 
         // Lower ground beyond a rim, one connected hollow at a time, nearest
@@ -256,14 +267,14 @@ pub fn fill(grid: &Grid, seed: IVec3, volume: i64) -> (Vec<IVec3>, Filled) {
                 way_out = way_out.or(Some(point(first)));
             } else if rest < FP * group.len() as i64 {
                 // Not enough to fill it: the water parts at the rim.
-                return (wet, Filled::Spilled { level, kept: volume - rest, at: Some(point(first)) });
+                return (wet, Filled::Spilled { level, kept: volume - rest, at: Some(point(first)) }, edge);
             } else {
                 wet.extend(group.iter().map(|&i| point(i)));
             }
         }
         if way_out.is_some() {
             let kept = FP * wet.len() as i64;
-            return (wet, Filled::Spilled { level, kept, at: way_out });
+            return (wet, Filled::Spilled { level, kept, at: way_out }, edge);
         }
 
         // The layer itself. Where it runs past the box, the edge of the box
@@ -273,12 +284,12 @@ pub fn fill(grid: &Grid, seed: IVec3, volume: i64) -> (Vec<IVec3>, Filled) {
         let n = flat.len() as i64;
         wet.extend(flat);
         if rest <= FP * n {
-            return (wet, Filled::Settled { level: level + (rest + n - 1) / n });
+            return (wet, Filled::Settled { level: level + (rest + n - 1) / n }, edge);
         }
     }
     // Still rising at the top of the box.
     let (level, kept) = (bottom(grid.origin.y + grid.dims.y), FP * wet.len() as i64);
-    (wet, Filled::Spilled { level, kept, at: None })
+    (wet, Filled::Spilled { level, kept, at: None }, true)
 }
 
 /// What spreading at a fixed level found.
@@ -469,16 +480,16 @@ mod tests {
         let seed = IVec3::new(15, 4, 15);
         // Three layers and a quarter of the fourth.
         let volume = 100 * FP * 3 + 100 * FP / 4;
-        let (cells, how) = fill(&grid, seed, volume);
+        let (cells, how, _) = fill(&grid, seed, volume);
         assert_eq!(how, Filled::Settled { level: bottom(7) + FP / 4 });
         assert_eq!(cells.len(), 400);
         assert!(cells.iter().all(|p| pit(*p) && (4..8).contains(&p.y)));
         // The same from anywhere in the pit, however it is seeded.
-        let (again, how_again) = fill(&grid, IVec3::new(10, 4, 19), volume);
+        let (again, how_again, _) = fill(&grid, IVec3::new(10, 4, 19), volume);
         assert_eq!(how_again, how);
         assert_eq!(again.len(), 400);
         // One unit of water wets the floor.
-        let (cells, how) = fill(&grid, seed, 1);
+        let (cells, how, _) = fill(&grid, seed, 1);
         assert_eq!((cells.len(), how), (100, Filled::Settled { level: bottom(4) + 1 }));
     }
 
@@ -486,7 +497,7 @@ mod tests {
     fn too_much_water_spills_over_the_rim_into_open_ground() {
         // The ground outside the pit slopes away to the east.
         let grid = carve(IVec3::new(48, 40, 48), |p| pit(p) || (p.x >= 24 && p.y >= 12 - (p.x - 24) / 2));
-        let (cells, how) = fill(&grid, IVec3::new(15, 4, 15), 100 * FP * 20);
+        let (cells, how, _) = fill(&grid, IVec3::new(15, 4, 15), 100 * FP * 20);
         // Eight layers fit below the rim at 12.
         let Filled::Spilled { level, kept, at: Some(at) } = how else { panic!("{how:?}") };
         assert_eq!((level, kept, cells.len()), (bottom(12), 800 * FP, 800));
@@ -504,10 +515,10 @@ mod tests {
         let seed = IVec3::new(15, 4, 15);
         let first = 100 * FP * 4;
         // Up to the notch, the first pit keeps everything.
-        let (cells, how) = fill(&grid, seed, first);
+        let (cells, how, _) = fill(&grid, seed, first);
         assert_eq!((cells.len(), how), (400, Filled::Settled { level: bottom(8) }));
         // A little more runs through the notch and belongs to the second pit.
-        let (cells, how) = fill(&grid, seed, first + 50 * FP);
+        let (cells, how, _) = fill(&grid, seed, first + 50 * FP);
         let Filled::Spilled { level, kept, at: Some(at) } = how else { panic!("{how:?}") };
         assert_eq!((cells.len(), level, kept), (400, bottom(8), first));
         assert!(second(at) && at.y < 8, "spills at {at}");
@@ -515,11 +526,11 @@ mod tests {
         // Enough to fill the second pit to the notch too, and both rise as one.
         let second_below = 50 * FP * 4;
         let both = first + second_below + (100 + 50 + 5) * FP / 2;
-        let (cells, how) = fill(&grid, seed, both);
+        let (cells, how, _) = fill(&grid, seed, both);
         assert_eq!(how, Filled::Settled { level: bottom(8) + FP / 2 });
         assert_eq!(cells.len(), 400 + 200 + 155);
         // Seeded from the second pit the answer is the same.
-        let (cells, how) = fill(&grid, IVec3::new(27, 4, 12), both);
+        let (cells, how, _) = fill(&grid, IVec3::new(27, 4, 12), both);
         assert_eq!((cells.len(), how), (755, Filled::Settled { level: bottom(8) + FP / 2 }));
     }
 
@@ -535,18 +546,18 @@ mod tests {
         let seed = IVec3::new(15, 4, 15);
         let (first, other) = (100 * FP * 4, 50 * FP * 4);
         // A little over the rim: it goes to the nearer hollow or off down the slope, not both.
-        let (cells, how) = fill(&grid, seed, first + 10 * FP);
+        let (cells, how, _) = fill(&grid, seed, first + 10 * FP);
         let Filled::Spilled { level, kept, at: Some(at) } = how else { panic!("{how:?}") };
         assert_eq!((cells.len(), level, kept), (400, bottom(8), first));
         assert!(second(at) && at.y < 8, "spills at {at}");
         // Plenty: both hollows are full to the rim and the rest leaves down the slope.
-        let (cells, how) = fill(&grid, seed, first + other + 1000 * FP);
+        let (cells, how, _) = fill(&grid, seed, first + other + 1000 * FP);
         let Filled::Spilled { level, kept, at: Some(at) } = how else { panic!("{how:?}") };
         assert_eq!((cells.len(), level, kept), (600, bottom(8), first + other));
         assert!(slope(at), "spills at {at}");
         assert!(cells.iter().all(|&p| (pit(p) || second(p)) && p.y < 8));
         // The same seen from the second hollow, so neither hands water back to the other.
-        let (cells, how) = fill(&grid, IVec3::new(4, 4, 12), first + other + 1000 * FP);
+        let (cells, how, _) = fill(&grid, IVec3::new(4, 4, 12), first + other + 1000 * FP);
         assert_eq!((cells.len(), how), (600, Filled::Spilled { level, kept, at: Some(at) }));
     }
 
@@ -560,7 +571,7 @@ mod tests {
         }
         assert_eq!(grid.holder(IVec3::new(12, 9, 12)), Some(BodyId::Ocean));
         assert!(grid.holder(IVec3::new(12, 8, 12)).is_none() && !grid.is_free(IVec3::new(12, 9, 12)));
-        let (cells, how) = fill(&grid, IVec3::new(15, 4, 15), 100 * FP * 30);
+        let (cells, how, _) = fill(&grid, IVec3::new(15, 4, 15), 100 * FP * 30);
         assert_eq!(how, Filled::Met { level: bottom(8), kept: 400 * FP, with: BodyId::Ocean });
         assert_eq!(cells.len(), 400);
         assert_eq!(run_down(&grid, IVec3::new(15, 20, 15)), Run::Into(BodyId::Ocean));

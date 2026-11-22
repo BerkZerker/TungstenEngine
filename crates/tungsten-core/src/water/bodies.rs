@@ -263,12 +263,19 @@ impl Water {
     /// Work out again where a pond's water lies. False if the terrain around
     /// it is not loaded, in which case it stays as it was.
     fn settle(&mut self, id: u32, volume: &Volume, generator: &Generator, hops: u8) -> bool {
+        let mut wide = false;
         loop {
             let Some(pond) = self.ponds.get(&id) else { return true };
-            let Some(mut grid) = Grid::new(volume, Grid::around(pond.seed), Grid::DIMS) else { return false };
-            if !grid.is_open(pond.seed) {
+            let (seed, held) = (pond.seed, pond.volume);
+            // A pond that has outgrown the first box is looked for in the wider one.
+            let first = Grid::around(seed);
+            let outgrown =
+                |(lo, hi): (IVec3, IVec3)| !(lo.cmpgt(first).all() && hi.cmplt(first + Grid::DIMS - 1).all());
+            let dims = if wide || pond.cells.bounds().is_some_and(outgrown) { Grid::WIDE } else { Grid::DIMS };
+            let Some(mut grid) = Grid::new(volume, Grid::centred(seed, dims), dims) else { return false };
+            if !grid.is_open(seed) {
                 // The seed was filled in: carry on from any cell that is left.
-                let (left, held) = (pond.cells.iter().find(|&p| grid.is_open(p)), pond.volume);
+                let left = pond.cells.iter().find(|&p| grid.is_open(p));
                 match left {
                     Some(p) => self.ponds.get_mut(&id).unwrap().seed = p,
                     None => {
@@ -280,12 +287,19 @@ impl Water {
                 continue;
             }
             self.mark(&mut grid, generator, Some(id));
-            let (seed, held) = (pond.seed, pond.volume);
-            let (cells, how) = match grid.holder(seed) {
+            let (cells, how, edge) = match grid.holder(seed) {
                 // Other water has come over the seed.
-                Some(with) => (Vec::new(), Filled::Met { level: bottom(seed.y), kept: 0, with }),
+                Some(with) => (Vec::new(), Filled::Met { level: bottom(seed.y), kept: 0, with }, false),
                 None => fill(&grid, seed, held),
             };
+            // Water that the box itself held in is looked at again in the
+            // wider one. Water that left over lower ground is not: where it
+            // comes to rest shows whether it had left the hollow.
+            let closed = matches!(how, Filled::Settled { .. } | Filled::Spilled { at: None, .. });
+            if edge && closed && dims != Grid::WIDE && volume.covers(Grid::centred(seed, Grid::WIDE), Grid::WIDE) {
+                wide = true;
+                continue;
+            }
             match how {
                 Filled::Settled { level } => self.place(id, cells, level, held),
                 Filled::Spilled { level, kept, at } => {
@@ -298,9 +312,11 @@ impl Water {
                     }
                 }
                 Filled::Met { with: BodyId::Pond(other), .. } => {
-                    // Two ponds in one hollow are one pond.
+                    // Two ponds in one hollow are one pond, as wide as both.
                     let other = self.remove(other).unwrap();
-                    self.ponds.get_mut(&id).unwrap().volume += other.volume;
+                    let pond = self.ponds.get_mut(&id).unwrap();
+                    pond.volume += other.volume;
+                    pond.cells.extend(other.cells.iter());
                     continue;
                 }
                 // Above the sea: what does not fit below the rim runs down into it.
@@ -742,6 +758,24 @@ mod tests {
         let (_, after) = world.water.ponds().find(|(_, p)| p.seed == before.seed).unwrap();
         assert_eq!((after.volume, after.level), (before.volume, before.level));
         assert_eq!(world.total(), poured + 500 * FP);
+    }
+
+    #[test]
+    fn a_hollow_wider_than_the_first_box_is_one_pond() {
+        let (mut world, here) = World::around(16, 16);
+        // A pit 19 m across with a floor of bowls and ridges.
+        for i in 0..25 {
+            world.dig(here + IVec3::new((i % 5 - 2) * 14, -6, (i / 5 - 2) * 14), 10);
+        }
+        let poured = 4000 * FP;
+        world.water.pour(here + IVec3::Y * 2, poured);
+        world.rest();
+        // All of it is held, nearly all in one pond that covers the bowls.
+        assert_eq!(world.water.stats().held, poured);
+        let (_, pond) = world.water.ponds().max_by_key(|(_, p)| p.volume).unwrap();
+        check(&world, pond);
+        let (lo, hi) = pond.cells.bounds().unwrap();
+        assert!(pond.volume > poured * 9 / 10 && hi.x - lo.x > Grid::DIMS.x, "{} in {lo} to {hi}", pond.volume);
     }
 
     #[test]

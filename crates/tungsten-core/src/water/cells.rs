@@ -35,6 +35,14 @@ impl PartialEq for Cells {
 
 impl Eq for Cells {}
 
+impl Extend<IVec3> for Cells {
+    fn extend<I: IntoIterator<Item = IVec3>>(&mut self, iter: I) {
+        for p in iter {
+            self.insert(p);
+        }
+    }
+}
+
 impl FromIterator<IVec3> for Cells {
     fn from_iter<I: IntoIterator<Item = IVec3>>(iter: I) -> Self {
         let mut cells = Self::default();
