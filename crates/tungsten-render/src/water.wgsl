@@ -8,7 +8,7 @@ struct Globals {
     sky_color: vec4<f32>,
     ground_color: vec4<f32>,
     fog_color: vec4<f32>,
-    // x: fog start distance, y: fog end distance, z: near plane distance.
+    // x: fog start distance, y: fog end distance.
     fog: vec4<f32>,
     materials: array<vec4<f32>, 4>,
     // xy: where the camera chunk's origin is in the ripple pattern, metres.
@@ -17,8 +17,8 @@ struct Globals {
 }
 
 @group(0) @binding(0) var<uniform> g: Globals;
-// Depth of the terrain already drawn, to tell how much water is in front of it.
-@group(0) @binding(1) var scene_depth: texture_depth_multisampled_2d;
+// Distance to the terrain already drawn, to tell how much water is in front of it.
+@group(0) @binding(1) var terrain_distance: texture_multisampled_2d<f32>;
 
 // Must match terrain.wgsl: water is hidden by the terrain of its own node.
 const DEPTH_PUSH: f32 = 2.0;
@@ -34,8 +34,6 @@ const MURK: f32 = 0.45;
 struct VsOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) world: vec3<f32>,
-    // x: distance along the view axis; y: the same as the depth buffer has it.
-    @location(1) view: vec2<f32>,
 }
 
 @vertex
@@ -50,11 +48,9 @@ fn vs(
     let cells = vec3<f32>(f32(pos.x) * node.w + node.x, node.y, f32(pos.y) * node.w + node.z);
     out.world = cells * g.camera.w;
     out.clip = g.view_proj * vec4<f32>(out.world, 1.0);
-    out.view = vec2<f32>(out.clip.w, out.clip.w);
     if (node.w > 1.0 && out.clip.w > 0.0) {
         let push = DEPTH_PUSH * node.w * g.camera.w;
         out.clip.z = out.clip.z * out.clip.w / (out.clip.w + push);
-        out.view.y = out.clip.w + push;
     }
     return out;
 }
@@ -94,10 +90,9 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
         return vec4<f32>(mix(glow, g.fog_color.rgb, fog), 0.55);
     }
 
-    // Metres of water looked through before the ground behind it. (Reverse-Z
-    // with an infinite far plane: depth is near / distance.)
-    let ground = g.fog.z / max(textureLoad(scene_depth, vec2<i32>(in.clip.xy), 0), 1e-7);
-    let through = max(ground - in.view.y, 0.0) * dist / in.view.x;
+    // Metres of water looked through before the ground behind it.
+    let ground = textureLoad(terrain_distance, vec2<i32>(in.clip.xy), 0).r;
+    let through = max(ground - dist, 0.0);
     // The thinnest water at a shore is not drawn: the surface is flat and
     // the lattice it was worked out on is not, so its edge is only near.
     let shore = smoothstep(0.0, 0.08, through * v.y);

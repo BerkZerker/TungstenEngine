@@ -140,7 +140,10 @@ impl Terrain {
                 module: &shader,
                 entry_point: Some("fs"),
                 compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL })],
+                targets: &[
+                    Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL }),
+                    Some(crate::renderer::DISTANCE_FORMAT.into()),
+                ],
             }),
             multiview_mask: None,
             cache: None,

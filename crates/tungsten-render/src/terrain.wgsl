@@ -9,7 +9,7 @@ struct Globals {
     ground_color: vec4<f32>,
     // rgb: fog colour, w: unused.
     fog_color: vec4<f32>,
-    // x: fog start distance, y: fog end distance, z: near plane distance.
+    // x: fog start distance, y: fog end distance.
     fog: vec4<f32>,
     materials: array<vec4<f32>, 4>,
     // Used by water.wgsl.
@@ -67,8 +67,16 @@ fn vs(in: VsIn) -> VsOut {
     return out;
 }
 
+struct FsOut {
+    @location(0) color: vec4<f32>,
+    // Distance from the camera, for water drawn over this to tell how much
+    // of it there is in front. The depth buffer will not do: it has coarse
+    // nodes pushed back.
+    @location(1) distance: vec4<f32>,
+}
+
 @fragment
-fn fs(in: VsOut) -> @location(0) vec4<f32> {
+fn fs(in: VsOut) -> FsOut {
     let to_camera = g.camera.xyz - in.world;
     // Faceted materials carry their face normal in the vertices.
     let n = normalize(in.normal);
@@ -77,7 +85,8 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let sun = g.sun_color.rgb * max(dot(n, g.sun_dir.xyz), 0.0);
     var color = in.color * (hemi + sun);
 
-    let fog = smoothstep(g.fog.x, g.fog.y, length(to_camera));
+    let distance = length(to_camera);
+    let fog = smoothstep(g.fog.x, g.fog.y, distance);
     color = mix(color, g.fog_color.rgb, fog);
-    return vec4<f32>(color, 1.0);
+    return FsOut(vec4<f32>(color, 1.0), vec4<f32>(distance, 0.0, 0.0, 0.0));
 }
