@@ -98,7 +98,9 @@ pub fn run(args: Args) -> Result<(), String> {
             },
         );
         let t = Instant::now();
-        renderer.set_water_levels(game.world.water().levels());
+        renderer.set_water_levels(game.world.water().levels(), 0.0);
+        let streams = game.world.water().streams_at(game.alpha() as f32);
+        renderer.set_water_streams(&streams, game.pour_arc());
         // Ripples are placed by simulation time, so a capture is repeatable.
         let time = game.tick as f32 * crate::player::TICK as f32;
         stats = renderer.render(&gpu, &view, &game.camera(), &sky, &lines, &text, time);
@@ -202,12 +204,18 @@ fn run_script(script: &str, game: &mut Game, gpu: &Gpu, renderer: &mut Renderer)
                     game.step(&mut input);
                     game.stream();
                     apply_events(game, gpu, renderer, None);
+                    renderer.set_water_levels(game.world.water().levels(), crate::player::TICK as f32);
                 }
             }
             "hold" | "release" => {
                 let down = name == "hold";
                 if arg == "lmb" {
                     input.break_held = down;
+                } else if arg == "rmb" {
+                    input.place_held = down;
+                    if down {
+                        input.place_clicks += 1;
+                    }
                 } else {
                     input.key(key_code(arg)?, down);
                     // Let the game see the press itself, as it would between frames.

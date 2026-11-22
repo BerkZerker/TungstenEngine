@@ -161,7 +161,7 @@ pub fn build(text: &mut TextBatch, info: &HudInfo) {
         m3(w.drained),
         m3(w.lost)
     );
-    let _ = writeln!(out, "sea     in {} cells  {} pending", w.sea_cells, w.sea_pending);
+    let _ = writeln!(out, "sea     in {} cells  {} pending  {} flows", w.sea_cells, w.sea_pending, w.flows);
     let _ = writeln!(
         out,
         "draw    {} calls  {:.0}k tris  gpu {:.0}/{:.0} MB",
@@ -183,7 +183,7 @@ pub fn build(text: &mut TextBatch, info: &HudInfo) {
     panel(text, 6.0 * s, 6.0 * s, s, WHITE, &out);
 
     // The key list, on as many lines as the window's width needs.
-    let help = "WASD move  Space jump  Shift run  Ctrl crouch  LMB break  RMB place  1-3 material  4 water  wheel brush  Space x2 fly  V vsync  F3 debug";
+    let help = "WASD move  Space jump  Shift run  Ctrl crouch  LMB break  RMB place/pour  1-3 material  4 water  wheel brush  Space x2 fly  V vsync  F3 debug";
     let columns = ((info.size.0 as f32 - 12.0 * s) / TextBatch::advance(s)) as usize;
     let mut lines: Vec<String> = Vec::new();
     for item in help.split("  ") {

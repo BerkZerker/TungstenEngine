@@ -6,7 +6,7 @@ use tungsten_core::edit::{EditRules, Exclude, FP, Op};
 use tungsten_core::material::{self, CarveMode};
 use tungsten_core::raycast::{RayHit, raycast};
 use tungsten_core::{Material, WorldParams};
-use tungsten_render::Camera;
+use tungsten_render::{Camera, PourArc};
 use tungsten_stream::store::{read_kv, write_kv};
 use tungsten_stream::{MeshEvent, Store, World};
 use winit::keyboard::KeyCode;
@@ -38,6 +38,8 @@ pub struct Game {
     pub selected: Material,
     /// Right click pours water instead of placing the selected material.
     pub pouring: bool,
+    /// True while water is actively streaming from the pour tool.
+    pouring_active: bool,
     pub brush_radius: f32,
     pub tick: u64,
     /// What the player is looking at, as of the last tick.
@@ -87,6 +89,7 @@ impl Game {
             world,
             selected: Material::Stone,
             pouring: false,
+            pouring_active: false,
             brush_radius: 1.5,
             tick: 0,
             aim: None,
@@ -224,6 +227,7 @@ impl Game {
                 _ => self.player.tick_idle(),
             }
             self.aim = None;
+            self.pouring_active = false;
             input.place_clicks = 0;
             return;
         }
@@ -285,6 +289,7 @@ impl Game {
         let eye = self.player.eye(1.0) / cell;
         let dir = self.player.view_dir();
         self.aim = raycast(self.world.volume(), eye, dir, REACH / cell as f32);
+        self.pouring_active = false;
         let clicks = std::mem::take(&mut input.place_clicks);
         if !input.break_held {
             (self.mining_ticks, self.stone_work, self.stone_chips) = (0, 0.0, 0);
@@ -332,12 +337,14 @@ impl Game {
                 self.world.edit(&op);
             }
         }
-        if clicks > 0 && self.pouring {
-            // A ball of water the size of the brush, let go just off the surface.
+        if self.pouring && (input.place_held || clicks > 0) {
+            // Holding right click pours a steady flow at a rate set by the brush size.
             let at = hit.pos + (hit.normal * 1.5).as_dvec3();
             let r = self.brush_radius as f64 / cell;
-            let volume = (4.0 / 3.0 * std::f64::consts::PI * r * r * r * FP as f64).round() as i64;
-            self.world.pour(at.floor().as_ivec3(), volume * clicks as i64);
+            let rate = (r * r * 30.0).round().max(1.0) as i64;
+            let mult = if input.place_held { 1 } else { clicks as i64 };
+            self.world.pour(at.floor().as_ivec3(), rate * mult);
+            self.pouring_active = input.place_held;
         } else if clicks > 0 {
             // Centre the stamp just outside the surface so it attaches to it.
             let center = hit.pos + (hit.normal * (self.brush_radius * 0.6 / cell as f32)).as_dvec3();
@@ -381,6 +388,23 @@ impl Game {
             pitch: self.player.pitch,
             fov_y: 70f32.to_radians(),
         }
+    }
+
+    /// Active cosmetic pour stream from the player's tool to the aimed surface.
+    pub fn pour_arc(&self) -> Option<PourArc> {
+        if !self.pouring_active {
+            return None;
+        }
+        let hit = self.aim?;
+        let cell = self.params().cell_size as f64;
+        let eye = self.player.eye(self.alpha());
+        let forward = self.player.view_dir().as_dvec3();
+        let (sy, cy) = self.player.yaw.sin_cos();
+        let right = DVec3::new(cy as f64, 0.0, sy as f64);
+        let up = right.cross(forward).normalize_or(DVec3::Y);
+        let from = eye + forward * 0.18 + right * 0.25 - up * 0.28;
+        let to = (hit.pos + (hit.normal * 0.5).as_dvec3()) * cell;
+        Some(PourArc { from, to, radius: self.brush_radius })
     }
 
     /// Distance in metres at which terrain stops being drawn.

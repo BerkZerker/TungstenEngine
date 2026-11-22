@@ -109,3 +109,72 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let alpha = clamp(1.0 - clear + sun.r, 0.0, 1.0) * shore;
     return vec4<f32>(mix(color, g.fog_color.rgb, fog), alpha);
 }
+
+// Moving water: pouring arcs and downhill streams.
+
+struct StreamIn {
+    @location(0) pos: vec3<f32>,
+    @location(1) along: f32,
+    @location(2) normal: vec3<f32>,
+    @location(3) foam: f32,
+}
+
+struct StreamOut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) world: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) along: f32,
+    @location(3) foam: f32,
+}
+
+@vertex
+fn vs_stream(in: StreamIn) -> StreamOut {
+    var out: StreamOut;
+    out.world = in.pos;
+    out.clip = g.view_proj * vec4<f32>(in.pos, 1.0);
+    out.normal = in.normal;
+    out.along = in.along;
+    out.foam = in.foam;
+    return out;
+}
+
+@fragment
+fn fs_stream(in: StreamOut) -> @location(0) vec4<f32> {
+    let to_camera = g.camera.xyz - in.world;
+    let dist = length(to_camera);
+    let v = to_camera / max(dist, 1e-4);
+    let t = g.water.z;
+
+    // Downstream-scrolling ripples and aerated streaks.
+    let flow = in.along * 6.0 - t * 18.0;
+    let cross = (in.world.x + in.world.z) * 5.0;
+    let w1 = sin(flow + sin(cross) * 0.9);
+    let w2 = sin(in.along * 11.0 - t * 28.0 - cross * 1.4);
+    let w3 = sin(in.along * 3.5 - t * 11.0 + in.world.y * 5.0);
+    let perturb = vec3<f32>(w1 * 0.065 + w2 * 0.035, w3 * 0.03, w2 * 0.065 - w1 * 0.035);
+    var n = normalize(in.normal + perturb / (1.0 + dist * dist / 4000.0));
+    if (dot(n, v) < 0.0) {
+        n = -n;
+    }
+
+    let fresnel = 0.03 + 0.97 * pow(1.0 - max(dot(n, v), 0.0), 4.5);
+    let r = reflect(-v, n);
+    let zenith = g.fog_color.rgb * vec3<f32>(0.42, 0.60, 0.92);
+    let sky = mix(g.fog_color.rgb, zenith, sqrt(clamp(r.y, 0.0, 1.0)));
+    let sun = g.sun_color.rgb * pow(max(dot(r, g.sun_dir.xyz), 0.0), 260.0) * 2.8;
+    let body = DEEP * (1.4 + 2.2 * max(g.sun_dir.y, 0.0));
+
+    // Whitewater streaks on falls, steep slopes, and the pouring jet.
+    let streak = smoothstep(0.25, 0.95, 0.45 + 0.35 * w1 + 0.25 * w2 + 0.2 * w3);
+    let white = clamp(in.foam * (0.18 + 0.48 * streak), 0.0, 0.62);
+    let foam_col = mix(g.fog_color.rgb, vec3<f32>(0.90, 0.95, 0.99), 0.72);
+    let water_col = mix(body, sky, fresnel) + sun;
+    let color = mix(water_col, foam_col, white);
+
+    let ground = textureLoad(terrain_distance, vec2<i32>(in.clip.xy), 0).r;
+    let through = max(ground - dist, 0.0);
+    let contact = smoothstep(0.0, 0.04, through);
+    let alpha = clamp(0.56 + 0.34 * fresnel + 0.25 * white + sun.r, 0.0, 0.94) * max(contact, 0.45);
+    let fog = smoothstep(g.fog.x, g.fog.y, dist);
+    return vec4<f32>(mix(color, g.fog_color.rgb, fog), alpha);
+}

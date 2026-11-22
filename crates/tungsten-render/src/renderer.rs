@@ -2,13 +2,14 @@ use glam::{IVec3, Vec3};
 use tungsten_core::material::MATERIALS;
 use tungsten_core::mesh::ChunkMesh;
 use tungsten_core::water::BodyId;
+use tungsten_core::water::bodies::Stream;
 use tungsten_core::{NodeKey, WorldParams};
 
 use crate::gpu::Gpu;
 use crate::lines::{LineBatch, LinePipeline};
 use crate::terrain::{Globals, Terrain};
 use crate::text::{TextBatch, TextPipeline};
-use crate::water::Water;
+use crate::water::{PourArc, Water};
 
 pub(crate) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// The terrain's distance from the camera in metres, for the water shader.
@@ -151,9 +152,15 @@ impl Renderer {
     }
 
     /// Surface levels, in fixed-point base cells, of the water bodies that
-    /// have moved since their nodes were meshed.
-    pub fn set_water_levels(&mut self, levels: impl IntoIterator<Item = (BodyId, i64)>) {
-        self.water.set_levels(levels);
+    /// have moved since their nodes were meshed. Drawn levels ease toward
+    /// these over `dt` seconds.
+    pub fn set_water_levels(&mut self, levels: impl IntoIterator<Item = (BodyId, i64)>, dt: f32) {
+        self.water.set_levels(levels, dt);
+    }
+
+    /// Active flowing streams and optional cosmetic pour arc for the next frame.
+    pub fn set_water_streams(&mut self, streams: &[Stream], pour: Option<PourArc>) {
+        self.water.set_streams(streams, pour);
     }
 
     /// Change which nodes are drawn. A node is hidden until shown.
@@ -222,70 +229,92 @@ impl Renderer {
         let glyphs = self.text.prepare(&gpu.device, &gpu.queue, self.size, text);
 
         let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
-        {
+        let clear =
+            wgpu::Color { r: sky.fog_color.x as f64, g: sky.fog_color.y as f64, b: sky.fog_color.z as f64, a: 1.0 };
+        if water_draws == 0 {
+            // No water in view: draw terrain and overlays in one pass, skipping
+            // the distance attachment and the second MSAA load/store.
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("terrain"),
-                color_attachments: &[
-                    Some(wgpu::RenderPassColorAttachment {
-                        view: &self.msaa,
-                        depth_slice: None,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color {
-                                r: sky.fog_color.x as f64,
-                                g: sky.fog_color.y as f64,
-                                b: sky.fog_color.z as f64,
-                                a: 1.0,
-                            }),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    }),
-                    Some(wgpu::RenderPassColorAttachment {
-                        view: &self.distance,
-                        depth_slice: None,
-                        resolve_target: None,
-                        // Where there is no terrain, the water is as deep as can be.
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color { r: 1e9, g: 0.0, b: 0.0, a: 0.0 }),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    }),
-                ],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth,
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Store }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            self.terrain.draw(&mut pass);
-        }
-        {
-            // Everything that is tested against the terrain's depth without
-            // writing its own. A pass of its own, so that the water shader
-            // can read what the terrain pass wrote.
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("water and overlays"),
+                label: Some("frame"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.msaa,
                     depth_slice: None,
                     resolve_target: Some(target),
-                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Discard },
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Discard },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth,
-                    depth_ops: None,
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Discard }),
                     stencil_ops: None,
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            self.water.draw(&mut pass);
+            self.terrain.draw(&mut pass, false);
             self.lines.draw(&mut pass, line_vertices);
             self.text.draw(&mut pass, glyphs);
+        } else {
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("terrain"),
+                    color_attachments: &[
+                        Some(wgpu::RenderPassColorAttachment {
+                            view: &self.msaa,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Store },
+                        }),
+                        Some(wgpu::RenderPassColorAttachment {
+                            view: &self.distance,
+                            depth_slice: None,
+                            resolve_target: None,
+                            // Where there is no terrain, the water is as deep as can be.
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Clear(wgpu::Color { r: 1e9, g: 0.0, b: 0.0, a: 0.0 }),
+                                store: wgpu::StoreOp::Store,
+                            },
+                        }),
+                    ],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.depth,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(0.0),
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                self.terrain.draw(&mut pass, true);
+            }
+            {
+                // Everything that is tested against the terrain's depth without
+                // writing its own. A pass of its own, so that the water shader
+                // can read what the terrain pass wrote.
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("water and overlays"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &self.msaa,
+                        depth_slice: None,
+                        resolve_target: Some(target),
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Discard },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.depth,
+                        depth_ops: None,
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                self.water.draw(&mut pass);
+                self.lines.draw(&mut pass, line_vertices);
+                self.text.draw(&mut pass, glyphs);
+            }
         }
         gpu.queue.submit([encoder.finish()]);
 

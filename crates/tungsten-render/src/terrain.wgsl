@@ -79,8 +79,7 @@ struct FsOut {
     @location(1) distance: vec4<f32>,
 }
 
-@fragment
-fn fs(in: VsOut) -> FsOut {
+fn shade(in: VsOut) -> vec4<f32> {
     // Two soft materials meet where their shares are equal: a sharp line,
     // smoothed over one pixel, not a fade.
     let second = clamp((in.share - 0.5) / max(fwidth(in.share), 1e-5) + 0.5, 0.0, 1.0);
@@ -96,5 +95,18 @@ fn fs(in: VsOut) -> FsOut {
     let distance = length(to_camera);
     let fog = smoothstep(g.fog.x, g.fog.y, distance);
     color = mix(color, g.fog_color.rgb, fog);
-    return FsOut(vec4<f32>(color, 1.0), vec4<f32>(distance, 0.0, 0.0, 0.0));
+    return vec4<f32>(color, distance);
+}
+
+@fragment
+fn fs(in: VsOut) -> FsOut {
+    let s = shade(in);
+    return FsOut(vec4<f32>(s.rgb, 1.0), vec4<f32>(s.a, 0.0, 0.0, 0.0));
+}
+
+// Single-target fragment shader used when no water is visible this frame,
+// avoiding the distance attachment and the second render pass.
+@fragment
+fn fs_plain(in: VsOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(shade(in).rgb, 1.0);
 }

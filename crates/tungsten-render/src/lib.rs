@@ -13,3 +13,4 @@ pub use gpu::Gpu;
 pub use lines::LineBatch;
 pub use renderer::{Camera, FrameStats, Renderer, Sky};
 pub use text::TextBatch;
+pub use water::PourArc;

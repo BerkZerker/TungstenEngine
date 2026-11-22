@@ -40,6 +40,7 @@ struct Visible {
 
 pub(crate) struct Terrain {
     pipeline: wgpu::RenderPipeline,
+    pipeline_plain: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
     globals: wgpu::Buffer,
     instances: wgpu::Buffer,
@@ -102,55 +103,58 @@ impl Terrain {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("terrain"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs"),
-                compilation_options: Default::default(),
-                buffers: &[
-                    Some(wgpu::VertexBufferLayout {
-                        array_stride: size_of::<MeshVertex>() as u64,
-                        step_mode: wgpu::VertexStepMode::Vertex,
-                        attributes: &wgpu::vertex_attr_array![0 => Uint16x4, 1 => Snorm16x2],
-                    }),
-                    Some(wgpu::VertexBufferLayout {
-                        array_stride: 16,
-                        step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &wgpu::vertex_attr_array![2 => Float32x4],
-                    }),
-                ],
-            },
-            primitive: wgpu::PrimitiveState {
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: Some(wgpu::Face::Back),
-                ..Default::default()
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: crate::renderer::DEPTH_FORMAT,
-                depth_write_enabled: Some(true),
-                // Reverse-Z: nearer fragments have larger depth.
-                depth_compare: Some(wgpu::CompareFunction::Greater),
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: wgpu::MultisampleState { count: samples, ..Default::default() },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs"),
-                compilation_options: Default::default(),
-                targets: &[
-                    Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL }),
-                    Some(crate::renderer::DISTANCE_FORMAT.into()),
-                ],
-            }),
-            multiview_mask: None,
-            cache: None,
-        });
+        let make_pipeline = |label: &str, entry: &str, targets: &[Option<wgpu::ColorTargetState>]| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[
+                        Some(wgpu::VertexBufferLayout {
+                            array_stride: size_of::<MeshVertex>() as u64,
+                            step_mode: wgpu::VertexStepMode::Vertex,
+                            attributes: &wgpu::vertex_attr_array![0 => Uint16x4, 1 => Snorm16x2],
+                        }),
+                        Some(wgpu::VertexBufferLayout {
+                            array_stride: 16,
+                            step_mode: wgpu::VertexStepMode::Instance,
+                            attributes: &wgpu::vertex_attr_array![2 => Float32x4],
+                        }),
+                    ],
+                },
+                primitive: wgpu::PrimitiveState {
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: Some(wgpu::Face::Back),
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: crate::renderer::DEPTH_FORMAT,
+                    depth_write_enabled: Some(true),
+                    // Reverse-Z: nearer fragments have larger depth.
+                    depth_compare: Some(wgpu::CompareFunction::Greater),
+                    stencil: Default::default(),
+                    bias: Default::default(),
+                }),
+                multisample: wgpu::MultisampleState { count: samples, ..Default::default() },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    targets,
+                }),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let color = Some(wgpu::ColorTargetState { format, blend: None, write_mask: wgpu::ColorWrites::ALL });
+        let pipeline = make_pipeline("terrain", "fs", &[color.clone(), Some(crate::renderer::DISTANCE_FORMAT.into())]);
+        let pipeline_plain = make_pipeline("terrain plain", "fs_plain", &[color]);
         let instance_capacity = 2048;
         Self {
             pipeline,
+            pipeline_plain,
             bind_group,
             globals,
             instances: Self::instance_buffer(device, instance_capacity),
@@ -282,11 +286,11 @@ impl Terrain {
         (self.visible.len() as u32, triangles)
     }
 
-    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>, with_distance: bool) {
         if self.visible.is_empty() {
             return;
         }
-        pass.set_pipeline(&self.pipeline);
+        pass.set_pipeline(if with_distance { &self.pipeline } else { &self.pipeline_plain });
         pass.set_bind_group(0, &self.bind_group, &[]);
         pass.set_vertex_buffer(1, self.instances.slice(..));
         let (mut vp, mut ip) = (u32::MAX, u32::MAX);

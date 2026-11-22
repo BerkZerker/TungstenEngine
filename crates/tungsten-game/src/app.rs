@@ -192,7 +192,9 @@ impl Running {
         let sky = Sky::daylight(self.game.view_distance());
         let camera = self.game.camera();
         hud::brush_outline(&mut self.lines, &self.game, &camera);
-        self.renderer.set_water_levels(self.game.world.water().levels());
+        self.renderer.set_water_levels(self.game.world.water().levels(), dt as f32);
+        let streams = self.game.world.water().streams_at(self.game.alpha() as f32);
+        self.renderer.set_water_streams(&streams, self.game.pour_arc());
         let time = self.started.elapsed().as_secs_f32();
         self.last_stats = self.renderer.render(&self.gpu, &view, &camera, &sky, &self.lines, &self.text, time);
         self.window.pre_present_notify();
@@ -243,7 +245,12 @@ impl ApplicationHandler for App {
                 }
                 match button {
                     MouseButton::Left => r.input.break_held = down,
-                    MouseButton::Right if down => r.input.place_clicks += 1,
+                    MouseButton::Right => {
+                        r.input.place_held = down;
+                        if down {
+                            r.input.place_clicks += 1;
+                        }
+                    }
                     _ => {}
                 }
             }

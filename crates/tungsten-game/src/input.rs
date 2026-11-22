@@ -11,6 +11,7 @@ pub struct Input {
     /// Mouse motion since the last frame, in device units.
     pub look: (f64, f64),
     pub break_held: bool,
+    pub place_held: bool,
     /// Right clicks since the last tick.
     pub place_clicks: u32,
     /// Scroll since the last frame, in lines; positive is away from the user.
@@ -64,6 +65,7 @@ impl Input {
     pub fn release_all(&mut self) {
         self.held.clear();
         self.break_held = false;
+        self.place_held = false;
     }
 
     pub fn end_frame(&mut self) {
