@@ -22,7 +22,7 @@ The first click captures the mouse; Esc releases it. The world is saved under
 | Shift | Run |
 | Ctrl | Crouch |
 | Left mouse (hold) | Break. Stone chips, then gives way a shard at a time |
-| Right mouse (click) | Place the selected material, or pour water |
+| Right mouse | Click to place the selected material; hold to pour water (key 4) |
 | 1 / 2 / 3 | Select stone / dirt / sand |
 | 4 | Select water |
 | Mouse wheel | Brush radius |
@@ -52,13 +52,16 @@ The world is a function: the terrain generator plus a log of every edit as a sha
 at five coarser levels, up to 8 m, out to the view distance, and an edit shows at
 every level. Only the log is saved. Sand stays where it is put for now.
 
-Water is a function too. The sea lies at 0 m wherever open ground is below it. A
-pond is a volume of water in a hollow: pour some with key 4 and right click, and
-it runs downhill to where it can lie. Dig a pond wider and it sinks, fill it in
-and it rises, dig through its rim and it runs on, into the next hollow or the
-sea; dig below 0 m beside the sea and the sea comes in. Water does not yet act
-on the player or on anything else. Ponds are saved in `water.bin` in the world's
-folder.
+Water is a function too. The sea lies at 0 m wherever open ground below sea
+level connects to it (inland hollows below 0 m stay dry until connected). A
+pond is a volume of water in a hollow: select water with key 4 and hold right
+click to pour a steady stream at a rate set by the brush size. Poured water and
+overflow run visibly downhill to where they can lie; dig a pond wider and its
+level eases down, fill it in and it rises, build a wall across it and it splits
+into two ponds, dig through its rim and it runs on into the next hollow or the
+sea; dig below 0 m beside the sea and the sea advances in. Water does not yet
+act on the player or on anything else. Ponds and active flows are saved in
+`water.bin` in the world's folder.
 
 Worlds are not kept compatible between versions of the engine yet. A world records
 the terrain generator it was made with and will not open after generation changes:
