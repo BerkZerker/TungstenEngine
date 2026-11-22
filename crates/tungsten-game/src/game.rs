@@ -24,6 +24,8 @@ const CUT_TICKS: u64 = 6;
 const STONE_WORK: f32 = 0.75;
 /// How far the player can reach to break or place, metres.
 pub const REACH: f32 = 6.0;
+/// The number key that selects water, and what the player file calls it.
+const WATER_SLOT: u8 = 4;
 /// Ticks between autosaves: 30 seconds.
 const AUTOSAVE_TICKS: u64 = 30 * tungsten_core::material::TICK_HZ as u64;
 
@@ -32,6 +34,8 @@ pub struct Game {
     pub world: World,
     pub player: Player,
     pub selected: Material,
+    /// Right click pours water instead of placing the selected material.
+    pub pouring: bool,
     pub brush_radius: f32,
     pub tick: u64,
     /// What the player is looking at, as of the last tick.
@@ -79,6 +83,7 @@ impl Game {
             player: Player::new(DVec3::new(x, ground + 2.0, z)),
             world,
             selected: Material::Stone,
+            pouring: false,
             brush_radius: 1.5,
             tick: 0,
             aim: None,
@@ -118,6 +123,7 @@ impl Game {
             self.brush_radius = (r as f32).clamp(BRUSH_MIN, BRUSH_MAX);
         }
         if let Some(m) = num("material") {
+            self.pouring = m as u8 == WATER_SLOT;
             self.selected = match Material::from_u8(m as u8) {
                 Material::Air => Material::Stone,
                 m => m,
@@ -146,7 +152,7 @@ impl Game {
                 ("yaw", p.yaw.to_string()),
                 ("pitch", p.pitch.to_string()),
                 ("brush_radius", self.brush_radius.to_string()),
-                ("material", (self.selected as u8).to_string()),
+                ("material", if self.pouring { WATER_SLOT } else { self.selected as u8 }.to_string()),
                 ("mode", if p.mode == Mode::Fly { "fly" } else { "walk" }.to_string()),
             ],
         )
@@ -178,9 +184,10 @@ impl Game {
         self.player.look(input.look.0, input.look.1);
         for &key in &input.pressed {
             match key {
-                KeyCode::Digit1 => self.selected = Material::Stone,
-                KeyCode::Digit2 => self.selected = Material::Dirt,
-                KeyCode::Digit3 => self.selected = Material::Sand,
+                KeyCode::Digit1 => (self.selected, self.pouring) = (Material::Stone, false),
+                KeyCode::Digit2 => (self.selected, self.pouring) = (Material::Dirt, false),
+                KeyCode::Digit3 => (self.selected, self.pouring) = (Material::Sand, false),
+                KeyCode::Digit4 => self.pouring = true,
                 KeyCode::Space if self.space_taps.press(self.tick) => self.player.toggle_fly(),
                 _ => {}
             }
@@ -227,6 +234,7 @@ impl Game {
             }
         }
         self.edit(input);
+        self.world.step_water();
         if self.tick.is_multiple_of(AUTOSAVE_TICKS) {
             if let Err(e) = self.save(false) {
                 eprintln!("tungsten: {e}");
@@ -289,7 +297,13 @@ impl Game {
                 self.world.edit(&op);
             }
         }
-        if clicks > 0 {
+        if clicks > 0 && self.pouring {
+            // A ball of water the size of the brush, let go just off the surface.
+            let at = hit.pos + (hit.normal * 1.5).as_dvec3();
+            let r = self.brush_radius as f64 / cell;
+            let volume = (4.0 / 3.0 * std::f64::consts::PI * r * r * r * FP as f64).round() as i64;
+            self.world.pour(at.floor().as_ivec3(), volume * clicks as i64);
+        } else if clicks > 0 {
             // Centre the stamp just outside the surface so it attaches to it.
             let center = hit.pos + (hit.normal * (self.brush_radius * 0.6 / cell as f32)).as_dvec3();
             let feet = self.player.pos / cell;

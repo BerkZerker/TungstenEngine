@@ -8,13 +8,20 @@
 //! its cells, merged into rectangles); the height comes from the body when
 //! the frame is drawn.
 
+pub mod bodies;
+pub mod cells;
+pub mod flood;
+
 use crate::coords::{CHUNK_SIZE, NodeKey};
 use crate::worldgen::{Generator, SEA_LEVEL};
 
 /// A connected piece of water with one surface level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum BodyId {
+    /// The sea: every part of it, at one fixed level.
     Ocean,
+    /// A finite body made by pouring, numbered in the order they were made.
+    Pond(u32),
 }
 
 /// The part of one body's surface that a node draws.
@@ -80,16 +87,70 @@ fn ocean_mask(generator: &Generator, key: NodeKey) -> Mask {
     mask
 }
 
-/// Water surfaces to draw with a node. Each surface belongs to the node that
-/// holds its anchor height, so stacked nodes never draw it twice.
-pub fn node_patches(generator: &Generator, key: NodeKey) -> Vec<WaterPatch> {
-    let mut patches = Vec::new();
-    // The sea is anchored at lattice height zero.
-    if key.pos.y == 0 {
-        let (vertices, indices) = mesh_mask(ocean_mask(generator, key));
-        if !indices.is_empty() {
-            patches.push(WaterPatch { body: BodyId::Ocean, level: 0, vertices, indices });
+/// Part of a surface that is known by its cells rather than by a rule: the
+/// wet lattice columns at its level, in the chunk columns near a node.
+#[derive(Clone, Debug)]
+pub struct Surface {
+    pub body: BodyId,
+    pub level: i64,
+    /// Chunk column `(x, z)` at the finest level, and its wet columns.
+    pub tiles: Vec<((i32, i32), Mask)>,
+}
+
+/// The water a node has to draw that the generator knows nothing about.
+#[derive(Clone, Debug, Default)]
+pub struct NodeWater {
+    pub surfaces: Vec<Surface>,
+}
+
+/// The cells of a node with a wet lattice column at any corner.
+fn cover(key: NodeKey, tiles: &[((i32, i32), Mask)]) -> Mask {
+    let (o, step) = (key.origin(), key.step());
+    let mut mask = [0u32; N];
+    // The node's cells on one axis that touch a lattice column: at most two.
+    let touched = |r: i32| {
+        let (a, b) = ((r - 1).div_euclid(step), r.div_euclid(step));
+        (a.max(0), b.min(N as i32 - 1))
+    };
+    for &((cx, cz), tile) in tiles {
+        for (z, &row) in tile.iter().enumerate() {
+            let (z0, z1) = touched(cz * CHUNK_SIZE + z as i32 - o.z);
+            let mut bits = row;
+            while bits != 0 && z0 <= z1 {
+                let x = bits.trailing_zeros() as i32;
+                bits &= bits - 1;
+                let (x0, x1) = touched(cx * CHUNK_SIZE + x - o.x);
+                for z in z0..=z1 {
+                    for x in x0..=x1 {
+                        mask[z as usize] |= 1 << x;
+                    }
+                }
+            }
         }
+    }
+    mask
+}
+
+/// Water surfaces to draw with a node. A surface belongs to the node that
+/// holds the lattice layer it is in, so stacked nodes never draw it twice.
+pub fn node_patches(generator: &Generator, key: NodeKey, water: &NodeWater) -> Vec<WaterPatch> {
+    let mut patches = Vec::new();
+    // The sea is in the layer at lattice height zero.
+    let mut sea = if key.pos.y == 0 { ocean_mask(generator, key) } else { [0; N] };
+    for surface in &water.surfaces {
+        let mask = cover(key, &surface.tiles);
+        if surface.body == BodyId::Ocean {
+            sea.iter_mut().zip(mask).for_each(|(row, more)| *row |= more);
+            continue;
+        }
+        let (vertices, indices) = mesh_mask(mask);
+        if !indices.is_empty() {
+            patches.push(WaterPatch { body: surface.body, level: surface.level, vertices, indices });
+        }
+    }
+    let (vertices, indices) = mesh_mask(sea);
+    if !indices.is_empty() {
+        patches.push(WaterPatch { body: BodyId::Ocean, level: bodies::SEA, vertices, indices });
     }
     patches
 }
@@ -146,9 +207,9 @@ mod tests {
             let shore = (44.0 / (spacing * N as f64)).floor() as i32;
             for cx in shore - 2..=shore + 2 {
                 let key = NodeKey::new(level, IVec3::new(cx, 0, 0));
-                let patches = node_patches(&g, key);
-                assert!(node_patches(&g, NodeKey::new(level, IVec3::new(cx, 1, 0))).is_empty());
-                assert!(node_patches(&g, NodeKey::new(level, IVec3::new(cx, -1, 0))).is_empty());
+                let patches = node_patches(&g, key, &NodeWater::default());
+                assert!(node_patches(&g, NodeKey::new(level, IVec3::new(cx, 1, 0)), &NodeWater::default()).is_empty());
+                assert!(node_patches(&g, NodeKey::new(level, IVec3::new(cx, -1, 0)), &NodeWater::default()).is_empty());
                 let cover = match patches.as_slice() {
                     [] => [[0u8; N]; N],
                     [p] => {

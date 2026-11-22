@@ -2,13 +2,14 @@ use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use glam::{DVec3, IVec3};
-use tungsten_core::coords::{APRON, CHUNK_SIZE, LEVELS, MAX_LEVEL, NodeKey, chunk_of};
+use tungsten_core::coords::{APRON, CHUNK_BITS, CHUNK_SIZE, LEVELS, MAX_LEVEL, NodeKey, chunk_of};
 use tungsten_core::edit::{self, EditOutcome, EditRules, Op};
 use tungsten_core::field::LocalField;
 use tungsten_core::hash::{IntMap, IntSet};
 use tungsten_core::log::{self, Baked, CellEdits, CellPos, CellSet, EditLog, TIERS};
 use tungsten_core::mesh::{ChunkMesh, mesh_block};
-use tungsten_core::water;
+use tungsten_core::water::bodies::Water;
+use tungsten_core::water::{self, NodeWater};
 use tungsten_core::worldgen::{Generated, Generator};
 use tungsten_core::{Chunk, ChunkPos, Volume, WorldParams};
 
@@ -71,6 +72,7 @@ enum Job {
         version: u64,
         group: u32,
         cells: CellSet,
+        water: NodeWater,
     },
     /// Remesh a finest-level node from its chunk and 26 neighbours, indexed
     /// as `neighbours()` yields them.
@@ -79,6 +81,7 @@ enum Job {
         version: u64,
         group: u32,
         chunks: Box<[Arc<Chunk>; 27]>,
+        water: NodeWater,
     },
     Bake {
         cell: CellPos,
@@ -123,6 +126,8 @@ struct Group {
     meshes: Vec<(NodeKey, u64, ChunkMesh)>,
 }
 
+/// Where a world's water is saved, beside its regions.
+const WATER_FILE: &str = "water.bin";
 const URGENT: u64 = 0;
 const IDLE: u64 = u64::MAX;
 /// Priority offset of meshes that only stand in while finer ones load.
@@ -140,6 +145,8 @@ pub struct World {
     /// The finest level around the focus, with every edit applied.
     volume: Volume,
     log: EditLog,
+    /// Ponds, and where the sea has come in. The sea itself is a function of the generator.
+    water: Water,
     store: Option<Arc<Store>>,
     /// Regions whose saved cells are in the log.
     regions: IntSet<RegionPos>,
@@ -209,7 +216,7 @@ impl World {
                     drop(chunks);
                     return;
                 }
-                Job::Node { key, version, group, cells } => {
+                Job::Node { key, version, group, cells, water } => {
                     let mut block = LocalField::block(key);
                     let generated = worker_gen.fill_block(key, &mut block);
                     log::resolve(&mut block, &rules, &cells);
@@ -220,19 +227,19 @@ impl World {
                         Generated::Uniform(_) if cells.is_empty() => ChunkMesh::default(),
                         _ => mesh_block(&block, margin),
                     };
-                    mesh.water = water::node_patches(&worker_gen, key);
+                    mesh.water = water::node_patches(&worker_gen, key, &water);
                     let chunk = (key.level == 0).then(|| match generated {
                         Generated::Uniform(s) if untouched(s) => Chunk::Uniform(s),
                         _ => block.interior(),
                     });
                     Done::Node { key, version, group, mesh, chunk }
                 }
-                Job::Mesh { key, version, group, chunks } => {
+                Job::Mesh { key, version, group, chunks, water } => {
                     // Copying 27 chunks into a block is the expensive part of
                     // starting a mesh, so it happens here, not on the main thread.
                     let block = LocalField::gather(key, &chunks);
                     let mut mesh = mesh_block(&block, 0);
-                    mesh.water = water::node_patches(&worker_gen, key);
+                    mesh.water = water::node_patches(&worker_gen, key, &water);
                     Done::Node { key, version, group, mesh, chunk: None }
                 }
                 Job::Bake { cell, edits } => {
@@ -244,6 +251,14 @@ impl World {
             let _ = if urgent { tx_urgent.send(result) } else { tx.send(result) };
         });
 
+        let water = match store.as_ref().and_then(|s| s.read_file(WATER_FILE)) {
+            Some(bytes) => Water::decode(&bytes).unwrap_or_else(|e| {
+                eprintln!("tungsten: saved water is unreadable ({e}); ignored");
+                Water::new()
+            }),
+            None => Water::new(),
+        };
+
         Self {
             params,
             rules,
@@ -251,6 +266,7 @@ impl World {
             generator,
             volume: Volume::new(),
             log: EditLog::new(),
+            water,
             store,
             regions: IntSet::default(),
             nodes: IntMap::default(),
@@ -289,6 +305,10 @@ impl World {
 
     pub fn log(&self) -> &EditLog {
         &self.log
+    }
+
+    pub fn water(&self) -> &Water {
+        &self.water
     }
 
     /// True once the finest-level chunk and its 26 neighbours hold data.
@@ -369,7 +389,21 @@ impl World {
         let step = key.step();
         let min = (key.pos * CHUNK_SIZE - APRON) * step;
         self.ensure_regions(CellPos::tier_of(key.level), min, min + (CHUNK_SIZE + 2 * APRON) * step);
-        Job::Node { key, version, group, cells: self.log.gather_node(key) }
+        Job::Node { key, version, group, cells: self.log.gather_node(key), water: self.water.node_water(key) }
+    }
+
+    /// A job that meshes a finest-level node again: from the loaded chunks if
+    /// all 27 are there, from scratch otherwise.
+    fn remesh_job(&mut self, key: NodeKey, version: u64, group: u32) -> Job {
+        let chunks: Option<Vec<Arc<Chunk>>> =
+            neighbours().map(|n| self.volume.chunks.get(&(key.pos + n)).cloned()).collect();
+        match chunks {
+            Some(chunks) => {
+                let chunks = chunks.into_boxed_slice().try_into().ok().expect("27 neighbours");
+                Job::Mesh { key, version, group, chunks, water: self.water.node_water(key) }
+            }
+            None => self.node_job(key, version, group),
+        }
     }
 
     /// Decide which nodes the focus asks for, start what they need and drop
@@ -660,10 +694,19 @@ impl World {
             self.log.push(&self.rules, fragments);
         }
 
+        // Water answers within the same tick, so the meshes of this edit
+        // already show where it now lies.
+        if let Some((min, max)) = outcome.changed {
+            self.water.edited(&self.volume, &self.generator, min, max);
+            self.water.step(&self.volume, &self.generator);
+        }
+
         let focus = self.focus.unwrap_or(DVec3::ZERO);
         let group = self.next_group;
         self.next_group = self.next_group.wrapping_add(1).max(1);
         let mut jobs = Vec::new();
+        // Nodes given a job here; water that changed in them needs no second one.
+        let mut done = IntSet::default();
 
         // The finest level: what changed is already in `volume`, so remesh
         // from it, all at once.
@@ -682,16 +725,9 @@ impl World {
                 continue;
             }
             let version = self.bump(key);
-            let chunks: Option<Vec<Arc<Chunk>>> =
-                neighbours().map(|n| self.volume.chunks.get(&(pos + n)).cloned()).collect();
-            let job = match chunks {
-                Some(chunks) => {
-                    let chunks = chunks.into_boxed_slice().try_into().ok().expect("27 neighbours");
-                    Job::Mesh { key, version, group, chunks }
-                }
-                None => self.node_job(key, version, group),
-            };
+            let job = self.remesh_job(key, version, group);
             jobs.push((URGENT, job));
+            done.insert(key);
         }
         if !jobs.is_empty() {
             self.groups.insert(group, Group { remaining: jobs.len(), meshes: Vec::with_capacity(jobs.len()) });
@@ -707,6 +743,7 @@ impl World {
                 let Some(n) = self.nodes.get(&key) else { continue };
                 let (wanted, refine) = (n.wanted, n.refine);
                 let version = self.bump(key);
+                done.insert(key);
                 if wanted && !refine {
                     self.nodes.get_mut(&key).unwrap().requested = Some(version);
                     let job = self.node_job(key, version, 0);
@@ -715,6 +752,7 @@ impl World {
             }
         }
         self.pool.push_all(jobs);
+        self.redraw_water(&mut done);
 
         // Bake cells that have collected enough ops.
         for cell in EditLog::cells_of(&self.rules, op) {
@@ -724,6 +762,59 @@ impl World {
             }
         }
         outcome
+    }
+
+    /// Let `volume` of water go at a finest-level cell; see [`Water::pour`].
+    pub fn pour(&mut self, at: IVec3, volume: i64) {
+        self.water.pour(at, volume);
+    }
+
+    /// True when water has nothing more to do in the terrain that is loaded.
+    pub fn water_at_rest(&self) -> bool {
+        self.water.at_rest(&self.volume)
+    }
+
+    /// One simulation tick of water.
+    pub fn step_water(&mut self) {
+        self.water.step(&self.volume, &self.generator);
+        self.redraw_water(&mut IntSet::default());
+    }
+
+    /// Mesh again the nodes, at every level, in which water surfaces changed,
+    /// other than those in `done`.
+    fn redraw_water(&mut self, done: &mut IntSet<NodeKey>) {
+        let changed = self.water.take_changed();
+        if changed.is_empty() {
+            return;
+        }
+        let focus = self.focus.unwrap_or(DVec3::ZERO);
+        let mut jobs = Vec::new();
+        for (min, max) in changed {
+            for level in 0..=MAX_LEVEL {
+                let shift = CHUNK_BITS + level as i32;
+                // A node also draws the wet columns along its far edges.
+                let lo = IVec3::new((min.x - 1) >> shift, min.y >> shift, (min.z - 1) >> shift);
+                let mut keys = Vec::new();
+                for_box(lo, max >> shift, |pos| keys.push(NodeKey::new(level, pos)));
+                for key in keys {
+                    let Some(n) = self.nodes.get(&key) else { continue };
+                    let (wanted, refine) = (n.wanted, n.refine);
+                    if !done.insert(key) {
+                        continue;
+                    }
+                    let version = self.bump(key);
+                    if level == 0 {
+                        let job = self.remesh_job(key, version, 0);
+                        jobs.push((URGENT + 1, job));
+                    } else if wanted && !refine {
+                        self.nodes.get_mut(&key).unwrap().requested = Some(version);
+                        let job = self.node_job(key, version, 0);
+                        jobs.push((priority(key, focus, false), job));
+                    }
+                }
+            }
+        }
+        self.pool.push_all(jobs);
     }
 
     /// Give a node a new version and return it.
@@ -747,11 +838,18 @@ impl World {
                 store.put(pos, cell.encode());
             }
         }
-        if wait {
+        let water = self.water.take_unsaved().then(|| self.water.encode());
+        let write = move || {
+            if let Some(bytes) = water {
+                store.write_file(WATER_FILE, &bytes)?;
+            }
             store.flush().map(|_| ())
+        };
+        if wait {
+            write()
         } else {
             std::thread::spawn(move || {
-                if let Err(e) = store.flush() {
+                if let Err(e) = write() {
                     eprintln!("tungsten: autosave failed: {e}");
                 }
             });
@@ -1010,6 +1108,92 @@ mod tests {
         assert!(block.fill != generated, "the coarse node does not see the edit");
         let n = &world.nodes[&key];
         assert_eq!(n.shown, Some(n.version));
+    }
+
+    #[test]
+    fn water_is_drawn_follows_edits_and_survives_restart() {
+        use tungsten_core::water::BodyId;
+        let dir = std::env::temp_dir().join(format!("tungsten-test-water-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let open = || {
+            let (store, params) = Store::open(&dir, WorldParams::default()).unwrap();
+            World::new(params, config(), Some(Arc::new(store)))
+        };
+        /// The nodes whose latest mesh draws a body, by level.
+        fn drawing(events: &[MeshEvent], body: impl Fn(BodyId) -> bool) -> [usize; LEVELS] {
+            let mut latest: IntMap<NodeKey, bool> = IntMap::default();
+            for e in events {
+                match e {
+                    MeshEvent::Upload { key, mesh, .. } => {
+                        latest.insert(*key, mesh.water.iter().any(|p| body(p.body)));
+                    }
+                    MeshEvent::Remove { key, .. } => {
+                        latest.remove(key);
+                    }
+                    MeshEvent::Visible { .. } => {}
+                }
+            }
+            let mut levels = [0; LEVELS];
+            latest.iter().filter(|(_, has)| **has).for_each(|(k, _)| levels[k.level as usize] += 1);
+            levels
+        }
+        let rest = |world: &mut World, events: &mut Vec<MeshEvent>, here: DVec3| {
+            for _ in 0..600 {
+                world.step_water();
+                if world.water_at_rest() {
+                    break;
+                }
+            }
+            assert!(world.water_at_rest());
+            settle(world, here, events);
+        };
+
+        let mut world = open();
+        let mut events = Vec::new();
+        let here = ground(&world);
+        settle(&mut world, here, &mut events);
+        // The sea is 30 m from here: every level draws some of it.
+        let sea = drawing(&events, |b| b == BodyId::Ocean);
+        assert!(sea.iter().all(|&n| n > 0), "sea drawn by level {sea:?}");
+        assert_eq!(drawing(&events, |b| b != BodyId::Ocean), [0; LEVELS]);
+
+        // A bowl in the ground with water let go over it.
+        let cells = (here / world.params().cell_size as f64).floor().as_ivec3();
+        let at = |p: IVec3| [p.x as i64 * FP, p.y as i64 * FP, p.z as i64 * FP];
+        world.edit(&Op::Break { center: at(cells - IVec3::Y * 3), radius: 8 * FP, nearest: false });
+        world.pour(cells + IVec3::Y * 4, 300 * FP);
+        events.clear();
+        rest(&mut world, &mut events, here);
+        let stats = world.water().stats();
+        assert_eq!((stats.ponds, stats.held + stats.moving + stats.drained + stats.lost), (1, 300 * FP));
+        let (id, pond) = world.water().ponds().next().map(|(id, p)| (id, p.clone())).unwrap();
+        let ponds = drawing(&events, |b| b == BodyId::Pond(id));
+        assert!(ponds[0] >= 1 && ponds[1..] == [0; LEVELS - 1], "pond drawn by level {ponds:?}");
+        assert!(world.water().levels().any(|l| l == (BodyId::Pond(id), pond.level)));
+
+        // Dug wider, the pond lies lower and is drawn again; from further off a coarser node draws it.
+        events.clear();
+        world.edit(&Op::Break { center: at(cells + IVec3::new(9, -3, 0)), radius: 8 * FP, nearest: false });
+        rest(&mut world, &mut events, here);
+        let lower = world.water().ponds().next().unwrap().1.clone();
+        assert!(lower.level < pond.level && lower.volume == pond.volume);
+        assert!(drawing(&events, |b| b == BodyId::Pond(id))[0] >= 1);
+        events.clear();
+        settle(&mut world, here + DVec3::new(60.0, 0.0, 0.0), &mut events);
+        let far = drawing(&events, |b| b == BodyId::Pond(id));
+        assert!(far[0] == 0 && far[1..].iter().sum::<usize>() >= 1, "pond drawn by level {far:?} from 60 m");
+
+        // Quit and restart: the pond is as it was, and drawn.
+        world.save(true).unwrap();
+        drop(world);
+        let mut world = open();
+        events.clear();
+        settle(&mut world, here, &mut events);
+        assert_eq!(world.water().stats(), stats);
+        assert!(*world.water().ponds().next().unwrap().1 == lower);
+        assert!(drawing(&events, |b| b == BodyId::Pond(id))[0] >= 1);
+        drop(world);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

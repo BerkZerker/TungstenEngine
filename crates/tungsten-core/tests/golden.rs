@@ -13,6 +13,7 @@ use tungsten_core::edit::{EditRules, FP, Op, edit_volume};
 use tungsten_core::field::LocalField;
 use tungsten_core::hash::fnv1a;
 use tungsten_core::log::{CellPos, EditLog, bake, resolve};
+use tungsten_core::water::bodies::Water;
 use tungsten_core::worldgen::{GENERATOR_VERSION, Generator};
 use tungsten_core::{MAX_LEVEL, NodeKey, Volume, WorldParams};
 
@@ -21,6 +22,7 @@ const EDITED: u64 = 0x37c3dd5efb1f4d93;
 const RESOLVED: u64 = 0x88b617e9558fa8d1;
 const SAVED: u64 = 0x6fabf7af924c70be;
 const BAKED: u64 = 0xff72da7184c9c3d7;
+const WATER: u64 = 0x8cf5fe850ad536ce;
 
 fn worlds() -> [WorldParams; 2] {
     [WorldParams::default(), WorldParams { seed: 12345, cell_size: 0.5, min_fragment: 0.75 }]
@@ -168,5 +170,67 @@ fn generation_edits_and_saves_match_golden_hashes() {
          const GENERATED: u64 = {:#018x};\nconst EDITED: u64 = {:#018x};\n\
          const RESOLVED: u64 = {:#018x};\nconst SAVED: u64 = {:#018x};\nconst BAKED: u64 = {:#018x};\n",
         actual[0], actual[1], actual[2], actual[3], actual[4]
+    );
+}
+
+/// Ponds poured, dug into, filled in and overflowed near the origin, and the
+/// sea let in through a channel, all on the finest level as the game holds it.
+#[test]
+fn water_matches_golden_hash() {
+    let mut hash = 0u64;
+    for params in worlds() {
+        let generator = Generator::new(params);
+        let rules = EditRules::new(&params);
+        let cell = params.cell_size as f64;
+        // The first column east of the origin that is under the sea.
+        let shore = (0..4000).find(|&x| generator.surface_height(x as f64 * cell, 0.0) < 0.0).unwrap();
+        let mut held = 0;
+        for x in [0, shore - 10] {
+            let ground = (generator.surface_height(x as f64 * cell, 0.0) as f64 / cell).floor() as i32;
+            let here = IVec3::new(x, ground, 0);
+            let mut volume = Volume::new();
+            for i in 0..125 {
+                let pos = chunk_of(here) + IVec3::new(i % 5, i / 25, i / 5 % 5) - 2;
+                volume.insert(pos, block(&generator, NodeKey::new(0, pos)).interior());
+            }
+            let mut water = Water::new();
+            let edit = |water: &mut Water, volume: &mut Volume, at: IVec3, radius: i64, place: bool| {
+                let center = [at.x as i64 * FP, at.y as i64 * FP, at.z as i64 * FP];
+                let op = match place {
+                    true => Op::Place { center, radius: radius * FP, material: 3, exclude: None },
+                    false => Op::Break { center, radius: radius * FP, nearest: false },
+                };
+                if let Some((min, max)) = edit_volume(volume, &rules, &op).changed {
+                    water.edited(volume, &generator, min, max);
+                }
+            };
+            let pit = here - IVec3::Y * 4;
+            for step in 0..240 {
+                match step {
+                    0 => edit(&mut water, &mut volume, pit, 7, false),
+                    5 => water.pour(here + IVec3::Y * 5, 250 * FP),
+                    40 => edit(&mut water, &mut volume, pit + IVec3::new(8, -1, 2), 6, false),
+                    70 => edit(&mut water, &mut volume, pit + IVec3::new(-2, -5, 0), 4, true),
+                    100 => water.pour(here + IVec3::new(3, 6, -2), 3000 * FP),
+                    // Towards the sea, where there is one within reach.
+                    130..=150 if step % 4 == 0 => {
+                        edit(&mut water, &mut volume, pit + IVec3::new(2 * (step - 126), 0, 0), 5, false)
+                    }
+                    _ => {}
+                }
+                water.step(&volume, &generator);
+            }
+            let stats = water.stats();
+            assert_eq!(stats.held + stats.moving + stats.drained + stats.lost, 3250 * FP, "water was not conserved");
+            held += stats.ponds + stats.sea_cells;
+            let bytes = water.encode();
+            assert!(Water::decode(&bytes).unwrap().encode() == bytes);
+            hash = fnv1a(hash, &bytes);
+        }
+        assert!(held > 0, "the session left no water behind");
+    }
+    assert_eq!(
+        hash, WATER,
+        "\nwater changed (generator version {GENERATOR_VERSION}):\nconst WATER: u64 = {hash:#018x};\n"
     );
 }

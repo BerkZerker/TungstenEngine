@@ -115,7 +115,8 @@ pub fn build(text: &mut TextBatch, info: &HudInfo) {
         if g.player.grounded { "  grounded" } else { "" },
         if g.player.crouching { "  crouching" } else { "" }
     );
-    let _ = writeln!(out, "brush {}  radius {:.2} m", g.selected.def().name, g.brush_radius);
+    let brush = if g.pouring { "water" } else { g.selected.def().name };
+    let _ = writeln!(out, "brush {}  radius {:.2} m", brush, g.brush_radius);
     match &g.aim {
         Some(hit) => {
             let _ = writeln!(
@@ -146,6 +147,20 @@ pub fn build(text: &mut TextBatch, info: &HudInfo) {
         stats.chunks, stats.dense, stats.jobs_queued, stats.jobs_running
     );
     let _ = writeln!(out, "edits   {} ops in {} cells  {} baked", stats.ops, stats.cells, stats.bakes);
+    let w = g.world.water().stats();
+    // Water volumes are in 1/256 of a cell cubed.
+    let m3 = |v: i64| v as f64 / 256.0 * (params.cell_size as f64).powi(3);
+    let _ = writeln!(
+        out,
+        "water   {} ponds {:.1} m3  moving {:.1}  to sea {:.1}  lost {:.1}  sea in {} cells ({} pending)",
+        w.ponds,
+        m3(w.held),
+        m3(w.moving),
+        m3(w.drained),
+        m3(w.lost),
+        w.sea_cells,
+        w.sea_pending
+    );
     let _ = writeln!(
         out,
         "draw    {} calls  {:.0}k tris  gpu {:.0}/{:.0} MB",
@@ -166,7 +181,7 @@ pub fn build(text: &mut TextBatch, info: &HudInfo) {
     let _ = write!(out, "{}", info.gpu);
     text.push(6.0 * s, 6.0 * s, s, WHITE, &out);
 
-    let help = "WASD move  Space jump  Shift run  Ctrl crouch  LMB break  RMB place  1-3 material  wheel brush  Space x2 fly  V vsync  F3 debug";
+    let help = "WASD move  Space jump  Shift run  Ctrl crouch  LMB break  RMB place  1-3 material  4 water  wheel brush  Space x2 fly  V vsync  F3 debug";
     let y = info.size.1 as f32 - TextBatch::line_height(s) - 4.0 * s;
     text.push(6.0 * s, y, s, DIM, help);
 }

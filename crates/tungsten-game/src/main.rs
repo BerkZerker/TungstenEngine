@@ -60,7 +60,7 @@ tungsten [options]
   --capture FILE.bmp  render one frame headless and exit
   --script CMDS       with --capture: play input first, e.g. 'look 0,-40; hold lmb; tick 90'
                       commands: tick N | hold K | release K | click | key K | look YAW,PITCH | scroll N
-                      keys: w a s d space shift ctrl lmb 1 2 3";
+                      keys: w a s d space shift ctrl lmb 1 2 3 4";
 
 fn parse_list<T: std::str::FromStr>(s: &str, sep: char, n: usize) -> Result<Vec<T>, String> {
     let v: Vec<T> = s.split(sep).filter_map(|p| p.trim().parse().ok()).collect();

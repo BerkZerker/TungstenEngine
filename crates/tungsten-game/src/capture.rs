@@ -98,6 +98,7 @@ pub fn run(args: Args) -> Result<(), String> {
             },
         );
         let t = Instant::now();
+        renderer.set_water_levels(game.world.water().levels());
         // Ripples are placed by simulation time, so a capture is repeatable.
         let time = game.tick as f32 * crate::player::TICK as f32;
         stats = renderer.render(&gpu, &view, &game.camera(), &sky, &lines, &text, time);
@@ -182,6 +183,7 @@ fn key_code(name: &str) -> Result<KeyCode, String> {
         "1" => KeyCode::Digit1,
         "2" => KeyCode::Digit2,
         "3" => KeyCode::Digit3,
+        "4" => KeyCode::Digit4,
         _ => return Err(format!("script: unknown key '{name}'")),
     })
 }

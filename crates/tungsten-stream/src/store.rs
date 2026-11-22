@@ -176,6 +176,16 @@ impl Store {
         &self.root
     }
 
+    /// A whole file kept beside the regions, if it exists.
+    pub fn read_file(&self, name: &str) -> Option<Vec<u8>> {
+        fs::read(self.root.join(name)).ok()
+    }
+
+    /// Replace a file kept beside the regions.
+    pub fn write_file(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        write_atomic(&self.root.join(name), self.temp_counter.fetch_add(1, Ordering::Relaxed), bytes)
+    }
+
     fn region_path(&self, (tier, r): RegionPos) -> PathBuf {
         self.root.join("regions").join(format!("r{tier}.{}.{}.{}.tngr", r.x, r.y, r.z))
     }
