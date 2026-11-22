@@ -132,11 +132,11 @@ fn cover(key: NodeKey, tiles: &[((i32, i32), Mask)]) -> Mask {
 }
 
 /// Water surfaces to draw with a node. A surface belongs to the node that
-/// holds the lattice layer it is in, so stacked nodes never draw it twice.
+/// holds its [`anchor`](flood::anchor) layer, so stacked nodes never draw it twice.
 pub fn node_patches(generator: &Generator, key: NodeKey, water: &NodeWater) -> Vec<WaterPatch> {
     let mut patches = Vec::new();
-    // The sea is in the layer at lattice height zero.
-    let mut sea = if key.pos.y == 0 { ocean_mask(generator, key) } else { [0; N] };
+    let anchored = flood::anchor(bodies::SEA).div_euclid(key.size()) == key.pos.y;
+    let mut sea = if anchored { ocean_mask(generator, key) } else { [0; N] };
     for surface in &water.surfaces {
         let mask = cover(key, &surface.tiles);
         if surface.body == BodyId::Ocean {
@@ -206,10 +206,11 @@ mod tests {
             let (mut wet, mut dry) = (0, 0);
             let shore = (44.0 / (spacing * N as f64)).floor() as i32;
             for cx in shore - 2..=shore + 2 {
-                let key = NodeKey::new(level, IVec3::new(cx, 0, 0));
+                // The node just under the surface draws it, and no other.
+                let key = NodeKey::new(level, IVec3::new(cx, -1, 0));
                 let patches = node_patches(&g, key, &NodeWater::default());
-                assert!(node_patches(&g, NodeKey::new(level, IVec3::new(cx, 1, 0)), &NodeWater::default()).is_empty());
-                assert!(node_patches(&g, NodeKey::new(level, IVec3::new(cx, -1, 0)), &NodeWater::default()).is_empty());
+                assert!(node_patches(&g, NodeKey::new(level, IVec3::new(cx, 0, 0)), &NodeWater::default()).is_empty());
+                assert!(node_patches(&g, NodeKey::new(level, IVec3::new(cx, -2, 0)), &NodeWater::default()).is_empty());
                 let cover = match patches.as_slice() {
                     [] => [[0u8; N]; N],
                     [p] => {

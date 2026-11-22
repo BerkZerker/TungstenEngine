@@ -32,6 +32,14 @@ pub fn top_layer(level: i64) -> i32 {
     (level + FP / 2 - 1).div_euclid(FP) as i32
 }
 
+/// The lattice layer that says which of a stack of nodes draws a surface at
+/// `level`: the one under the highest with water in it, so that the surface
+/// is drawn with the ground seen through it, at the same level of detail.
+#[inline]
+pub fn anchor(level: i64) -> i32 {
+    top_layer(level) - 1
+}
+
 const ROCK: u8 = 0;
 const FREE: u8 = 1;
 /// Cells of value `HELD + i` hold water of `owners[i]`.

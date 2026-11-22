@@ -1152,9 +1152,9 @@ mod tests {
         let mut events = Vec::new();
         let here = ground(&world);
         settle(&mut world, here, &mut events);
-        // The sea is 30 m from here: every level draws some of it.
+        // The sea is 30 m from here, beyond the finest nodes: every coarser level draws some of it.
         let sea = drawing(&events, |b| b == BodyId::Ocean);
-        assert!(sea.iter().all(|&n| n > 0), "sea drawn by level {sea:?}");
+        assert!(sea[1..].iter().all(|&n| n > 0), "sea drawn by level {sea:?}");
         assert_eq!(drawing(&events, |b| b != BodyId::Ocean), [0; LEVELS]);
 
         // A bowl in the ground with water let go over it.

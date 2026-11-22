@@ -32,6 +32,7 @@ struct Visible {
 
 pub(crate) struct Water {
     pipeline: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
     bind_group: wgpu::BindGroup,
     instances: wgpu::Buffer,
     instance_capacity: usize,
@@ -45,30 +46,45 @@ pub(crate) struct Water {
 }
 
 impl Water {
-    /// `globals` is the terrain's uniform buffer, which the water shader shares.
-    pub fn new(device: &wgpu::Device, format: wgpu::TextureFormat, samples: u32, globals: &wgpu::Buffer) -> Self {
+    /// `globals` is the terrain's uniform buffer, which the water shader
+    /// shares; `depth` is the depth attachment the terrain is drawn to.
+    pub fn new(
+        device: &wgpu::Device,
+        format: wgpu::TextureFormat,
+        samples: u32,
+        globals: &wgpu::Buffer,
+        depth: &wgpu::TextureView,
+    ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("water"),
             source: wgpu::ShaderSource::Wgsl(include_str!("water.wgsl").into()),
         });
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("water"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: true,
+                    },
+                    count: None,
+                },
+            ],
         });
-        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("water"),
-            layout: &layout,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() }],
-        });
+        let bind_group = Self::bind(device, &layout, globals, depth);
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("water"),
             bind_group_layouts: &[Some(&layout)],
@@ -121,6 +137,7 @@ impl Water {
         let instance_capacity = 1024;
         Self {
             pipeline,
+            layout,
             bind_group,
             instances: Self::instance_buffer(device, instance_capacity),
             instance_capacity,
@@ -131,6 +148,27 @@ impl Water {
             visible: Vec::new(),
             origins: Vec::new(),
         }
+    }
+
+    fn bind(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        globals: &wgpu::Buffer,
+        depth: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("water"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: globals.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(depth) },
+            ],
+        })
+    }
+
+    /// Point at a new depth attachment, after a resize.
+    pub fn rebind(&mut self, device: &wgpu::Device, globals: &wgpu::Buffer, depth: &wgpu::TextureView) {
+        self.bind_group = Self::bind(device, &self.layout, globals, depth);
     }
 
     fn instance_buffer(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {

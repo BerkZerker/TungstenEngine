@@ -96,7 +96,8 @@ fn attachment(device: &wgpu::Device, label: &str, format: wgpu::TextureFormat, s
             sample_count: SAMPLES,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            // The water shader reads the depth of the terrain behind it.
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         })
         .create_view(&wgpu::TextureViewDescriptor::default())
@@ -106,13 +107,14 @@ impl Renderer {
     pub fn new(gpu: &Gpu, format: wgpu::TextureFormat, width: u32, height: u32, params: WorldParams) -> Self {
         let size = (width.max(1), height.max(1));
         let terrain = Terrain::new(&gpu.device, format, SAMPLES);
+        let depth = attachment(&gpu.device, "depth", DEPTH_FORMAT, size);
         Self {
             format,
             size,
             params,
             msaa: attachment(&gpu.device, "msaa color", format, size),
-            depth: attachment(&gpu.device, "depth", DEPTH_FORMAT, size),
-            water: Water::new(&gpu.device, format, SAMPLES, terrain.globals()),
+            water: Water::new(&gpu.device, format, SAMPLES, terrain.globals(), &depth),
+            depth,
             terrain,
             lines: LinePipeline::new(&gpu.device, format, SAMPLES),
             text: TextPipeline::new(&gpu.device, format, SAMPLES),
@@ -129,6 +131,7 @@ impl Renderer {
             self.size = size;
             self.msaa = attachment(&gpu.device, "msaa color", self.format, size);
             self.depth = attachment(&gpu.device, "depth", DEPTH_FORMAT, size);
+            self.water.rebind(&gpu.device, self.terrain.globals(), &self.depth);
         }
     }
 
@@ -180,7 +183,7 @@ impl Renderer {
             sky_color: v4(sky.sky_color, 0.0),
             ground_color: v4(sky.ground_color, 0.0),
             fog_color: v4(sky.fog_color, 0.0),
-            fog: [sky.fog_start, sky.fog_end, 0.0, 0.0],
+            fog: [sky.fog_start, sky.fog_end, Z_NEAR, 0.0],
             materials: std::array::from_fn(|i| {
                 let c = MATERIALS[i].color;
                 [c[0], c[1], c[2], 1.0]
@@ -216,11 +219,11 @@ impl Renderer {
         let mut encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("main"),
+                label: Some("terrain"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &self.msaa,
                     depth_slice: None,
-                    resolve_target: Some(target),
+                    resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
                             r: sky.fog_color.x as f64,
@@ -228,12 +231,12 @@ impl Renderer {
                             b: sky.fog_color.z as f64,
                             a: 1.0,
                         }),
-                        store: wgpu::StoreOp::Discard,
+                        store: wgpu::StoreOp::Store,
                     },
                 })],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth,
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Discard }),
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Store }),
                     stencil_ops: None,
                 }),
                 timestamp_writes: None,
@@ -241,6 +244,28 @@ impl Renderer {
                 multiview_mask: None,
             });
             self.terrain.draw(&mut pass);
+        }
+        {
+            // Everything that is tested against the terrain's depth without
+            // writing its own. The depth is read-only here, which lets the
+            // water shader sample it.
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("water and overlays"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.msaa,
+                    depth_slice: None,
+                    resolve_target: Some(target),
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Discard },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth,
+                    depth_ops: None,
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
             self.water.draw(&mut pass);
             self.lines.draw(&mut pass, line_vertices);
             self.text.draw(&mut pass, glyphs);

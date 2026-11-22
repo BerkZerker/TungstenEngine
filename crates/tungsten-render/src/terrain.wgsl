@@ -9,7 +9,7 @@ struct Globals {
     ground_color: vec4<f32>,
     // rgb: fog colour, w: unused.
     fog_color: vec4<f32>,
-    // x: fog start distance, y: fog end distance.
+    // x: fog start distance, y: fog end distance, z: near plane distance.
     fog: vec4<f32>,
     materials: array<vec4<f32>, 4>,
     // Used by water.wgsl.

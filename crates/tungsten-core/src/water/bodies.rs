@@ -25,7 +25,7 @@ use crate::edit::FP;
 use crate::worldgen::{Generator, SEA_LEVEL};
 
 use super::cells::Cells;
-use super::flood::{Filled, Grid, Run, bottom, fill, run_down, spread, top_layer};
+use super::flood::{Filled, Grid, Run, anchor, bottom, fill, run_down, spread, top_layer};
 use super::{BodyId, NodeWater, Surface};
 
 /// Level of the sea, fixed-point base cells. The sea's surface is anchored
@@ -84,8 +84,8 @@ pub struct Water {
     /// Volume that is gone: puddles too small to keep, ponds buried whole,
     /// and overflows followed through too many hollows.
     lost: i64,
-    /// Boxes (inclusive, with the surface layers as their height) in which
-    /// surfaces changed and have to be drawn again.
+    /// Boxes (inclusive, with the surfaces' anchor layers as their height)
+    /// in which surfaces changed and have to be drawn again.
     changed: Vec<(IVec3, IVec3)>,
     unsaved: bool,
 }
@@ -156,7 +156,7 @@ impl Water {
     }
 
     /// Boxes in which water surfaces changed since the last call. Height is
-    /// the lattice layers the surfaces were and are in.
+    /// the layers the surfaces were and are anchored in.
     pub fn take_changed(&mut self) -> Vec<(IVec3, IVec3)> {
         std::mem::take(&mut self.changed)
     }
@@ -190,7 +190,7 @@ impl Water {
 
     fn note(&mut self, cells: Option<(IVec3, IVec3)>, levels: [i64; 2]) {
         let Some((lo, hi)) = cells else { return };
-        let (a, b) = (top_layer(levels[0]), top_layer(levels[1]));
+        let (a, b) = (anchor(levels[0]), anchor(levels[1]));
         // A wet column is drawn by the cells on every side of it.
         self.changed.push((IVec3::new(lo.x - 1, a.min(b), lo.z - 1), IVec3::new(hi.x + 1, a.max(b), hi.z + 1)));
         self.unsaved = true;
@@ -475,10 +475,10 @@ impl Water {
         let mut out = NodeWater::default();
         let (o, size) = (key.origin(), key.size());
         let mut add = |body: BodyId, level: i64, cells: &Cells| {
-            let layer = top_layer(level);
+            let (layer, anchor) = (top_layer(level), anchor(level));
             let Some((lo, hi)) = cells.bounds() else { return };
             // A node draws a wet column on its far edge too.
-            let outside = layer < o.y || layer >= o.y + size || hi.x < o.x || lo.x > o.x + size;
+            let outside = anchor < o.y || anchor >= o.y + size || hi.x < o.x || lo.x > o.x + size;
             if outside || hi.z < o.z || lo.z > o.z + size {
                 return;
             }
@@ -685,7 +685,7 @@ mod tests {
         let drawn = world.water.take_changed();
         assert!(!drawn.is_empty());
         let (lo, hi) = pond.cells.bounds().unwrap();
-        assert!(drawn.iter().any(|(a, b)| a.x < lo.x && b.x > hi.x && a.y <= top_layer(pond.level)));
+        assert!(drawn.iter().any(|(a, b)| a.x < lo.x && b.x > hi.x && a.y <= anchor(pond.level)));
 
         // A second bowl cut into the side of the first: the same water lies lower.
         world.dig(pit + IVec3::new(9, 0, 0), 8);
@@ -804,7 +804,7 @@ mod tests {
             }
         }
         // The surface over the pit is handed to the node that draws it.
-        let key = NodeKey::new(0, chunk_of(IVec3::new(pit.x, 0, pit.z)));
+        let key = NodeKey::new(0, chunk_of(IVec3::new(pit.x, anchor(SEA), pit.z)));
         let surfaces = world.water.node_water(key).surfaces;
         assert!(matches!(surfaces.as_slice(), [Surface { body: BodyId::Ocean, level: SEA, .. }]));
         let patches = crate::water::node_patches(&world.generator, key, &world.water.node_water(key));
