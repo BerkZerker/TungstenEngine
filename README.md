@@ -43,7 +43,8 @@ modes below, and these:
 
 One biome, banded by height: sand below 0 m, dirt up to 40 m, bare stone above, with
 the two lines wandering by a few metres. Mountain ranges reach about 180 m and carry
-the cliffs and overhangs; caves run through all of it. Materials meet at a hard edge.
+the cliffs and overhangs; caves run through all of it. Sand and dirt meet along a
+smooth line; stone meets everything at a hard, angular edge.
 
 The world is a function: the terrain generator plus a log of every edit as a shape
 (a ball broken out, a ball placed). It is sampled every 0.25 m beside the player and

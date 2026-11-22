@@ -52,6 +52,11 @@ next. Old worlds are not kept readable.
   generated at levels 0 to 3 only. Where the dirt or sand cover is thinner
   than a coarse cell, the cover material still wins, so bedrock does not show
   through at a distance.
+- **Borders.** Stone meets other materials along the lattice, at a hard edge.
+  Soft materials (dirt, sand) meet along a smooth line: each vertex carries
+  the two materials' shares of the solid samples around it (4 x 4 x 4,
+  weighted 1 3 3 1 per axis), and the shader draws the line where the
+  interpolated shares are equal, one pixel wide. No colour fade.
 - **Mining.** Dirt and sand: every 6 ticks a ball is cut, sunk 0.1 s of the
   material's dig speed (dirt 2.5 m/s, sand 5 m/s) into the surface along its
   normal. Stone: after 0.75 m of work at 1 m/s the shard under the crosshair
@@ -64,7 +69,7 @@ next. Old worlds are not kept readable.
 
 **Verified by running it**
 
-- 45 tests pass; clippy is clean with warnings as errors.
+- 47 tests pass; clippy is clean with warnings as errors.
 - Golden hashes (generated blocks at all six levels near and 500 km from the
   origin, a 120-op editing session, the same session resolved from the log at
   every level, and the encoded log before and after baking) are identical on
@@ -89,7 +94,8 @@ next. Old worlds are not kept readable.
 
 **Known limits**
 
-- Material boundaries are blocky far away: they are hard edges on 4 to 8 m cells.
+- Stone's boundaries are blocky far away: they are hard edges on 4 to 8 m cells.
+- The line between sand and dirt steps slightly where two levels of detail meet.
 - Cave mouths close beyond about 250 m, where level 4 takes over.
 - Collision and raycasts use level-0 samples, loaded within about 16 m of the
   player; flying faster than terrain loads is allowed, walking waits for it.
