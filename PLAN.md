@@ -177,10 +177,13 @@ and collision do not know it is there.
   dug through to the sea. In `tungsten-stream`: the sea is drawn at the
   coarser levels and a pond at the level it is seen at, follows an edit, and
   is the same after a save and restart.
-- Benchmark, v0.2 and this branch built and run in turn on the same machine:
-  0.34 to 0.36 ms of main-thread time per tick on average for v0.2, 0.35 for
-  water; worst tick 0.9 to 1.2 ms for both; no tick spent waiting for terrain.
-  The benchmark has no ponds in it; settling one is timed above.
+- Benchmark, main and this branch built and run in turn on the same machine,
+  twelve runs of main and sixteen of water: 0.33 to 0.35 ms of main-thread
+  time per tick on average for main, 0.34 to 0.40 for water; no tick spent
+  waiting for terrain. The worst tick was 0.8 to 1.3 ms in every run of main
+  and 0.9 to 1.6 ms in thirteen of water; three runs of water had one tick of
+  3.6, 4.7 and 26 ms, not seen again in the eight runs after and not
+  explained. The benchmark has no ponds in it; settling one is timed above.
 - Headless captures: the sea from the shore and from 30 to 150 m up, out to
   the fog; a pond in a dug pit from above, after a restart, after digging
   beside it, and from 35 m at a coarser level; the sea entering a pit dug at
