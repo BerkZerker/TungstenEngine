@@ -8,7 +8,8 @@ use tungsten_core::field::LocalField;
 use tungsten_core::hash::{IntMap, IntSet};
 use tungsten_core::log::{self, Baked, CellEdits, CellPos, CellSet, EditLog, TIERS};
 use tungsten_core::mesh::{ChunkMesh, mesh_block};
-use tungsten_core::water::bodies::Water;
+use tungsten_core::water::bodies::{JOIN, Water};
+use tungsten_core::water::job::{Outcome, Request, Terrain, WaterJob};
 use tungsten_core::water::{self, NodeWater};
 use tungsten_core::worldgen::{Generated, Generator};
 use tungsten_core::{Chunk, ChunkPos, Volume, WorldParams};
@@ -87,6 +88,8 @@ enum Job {
         cell: CellPos,
         edits: Arc<CellEdits>,
     },
+    /// A water search (pond settle, flow route, or sea advance).
+    Water(WaterJob),
     /// Free unloaded chunks off the main thread.
     Release(Vec<Arc<Chunk>>),
 }
@@ -157,6 +160,8 @@ pub struct World {
     done: Receiver<Done>,
     /// Results of edit remeshes, kept apart so streaming cannot delay them.
     done_urgent: Receiver<Done>,
+    /// Outcome of the in-flight water search, awaited at its fixed tick.
+    done_water: Receiver<Outcome>,
     /// Focus in base cells, as of the last look at the tree.
     focus: Option<DVec3>,
     groups: IntMap<u32, Group>,
@@ -201,6 +206,31 @@ fn for_box(min: IVec3, max: IVec3, mut f: impl FnMut(IVec3)) {
     }
 }
 
+/// Load the saved edits of every region of `tier` overlapping base-cell bounds `[min, max]`.
+fn load_regions(
+    store: Option<&Store>,
+    log: &mut EditLog,
+    regions: &mut IntSet<RegionPos>,
+    tier: u8,
+    min: IVec3,
+    max: IVec3,
+) {
+    let Some(store) = store else { return };
+    let shift = CellPos::bits(tier) + REGION_BITS;
+    for_box(min >> shift, max >> shift, |r| {
+        if !regions.insert((tier, r)) {
+            return;
+        }
+        for (pos, bytes) in store.region((tier, r)) {
+            match CellEdits::decode(&bytes) {
+                Ok(edits) => log.insert(pos, edits),
+                // Edits that cannot be read leave the generated terrain as it is.
+                Err(e) => eprintln!("tungsten: saved edits of cell {pos:?} are unreadable ({e}); ignored"),
+            }
+        }
+    });
+}
+
 impl World {
     /// With a `store`, saved edits are loaded as their region comes into use
     /// and new ones are written back on [`save`](Self::save).
@@ -209,11 +239,16 @@ impl World {
         let rules = EditRules::new(&params);
         let (tx, done): (Sender<Done>, _) = unbounded();
         let (tx_urgent, done_urgent): (Sender<Done>, _) = unbounded();
+        let (tx_water, done_water): (Sender<Outcome>, _) = unbounded();
         let worker_gen = generator.clone();
         let pool = Pool::new(config.workers, move |job: Job| {
             let result = match job {
                 Job::Release(chunks) => {
                     drop(chunks);
+                    return;
+                }
+                Job::Water(job) => {
+                    let _ = tx_water.send(job.run(&worker_gen, &rules));
                     return;
                 }
                 Job::Node { key, version, group, cells, water } => {
@@ -274,6 +309,7 @@ impl World {
             pool,
             done,
             done_urgent,
+            done_water,
             focus: None,
             groups: IntMap::default(),
             next_group: 1,
@@ -368,21 +404,7 @@ impl World {
     /// Load the saved edits of every region of `tier` overlapping base-cell
     /// bounds `[min, max]`.
     fn ensure_regions(&mut self, tier: u8, min: IVec3, max: IVec3) {
-        let Some(store) = &self.store else { return };
-        let shift = CellPos::bits(tier) + REGION_BITS;
-        let (log, regions) = (&mut self.log, &mut self.regions);
-        for_box(min >> shift, max >> shift, |r| {
-            if !regions.insert((tier, r)) {
-                return;
-            }
-            for (pos, bytes) in store.region((tier, r)) {
-                match CellEdits::decode(&bytes) {
-                    Ok(edits) => log.insert(pos, edits),
-                    // Edits that cannot be read leave the generated terrain as it is.
-                    Err(e) => eprintln!("tungsten: saved edits of cell {pos:?} are unreadable ({e}); ignored"),
-                }
-            }
-        });
+        load_regions(self.store.as_deref(), &mut self.log, &mut self.regions, tier, min, max);
     }
 
     fn node_job(&mut self, key: NodeKey, version: u64, group: u32) -> Job {
@@ -472,7 +494,7 @@ impl World {
                 Job::Node { key, version, group: 0, .. } => {
                     nodes.get(key).filter(|n| n.version == *version).map(|n| priority(*key, focus, n.refine))
                 }
-                Job::Node { .. } | Job::Mesh { .. } => Some(URGENT),
+                Job::Node { .. } | Job::Mesh { .. } | Job::Water(_) => Some(URGENT),
                 Job::Bake { .. } | Job::Release(_) => Some(IDLE),
             });
         }
@@ -694,11 +716,10 @@ impl World {
             self.log.push(&self.rules, fragments);
         }
 
-        // Water answers within the same tick, so the meshes of this edit
-        // already show where it now lies.
+        // Notify water of the terrain change; settling runs on workers on the
+        // fixed simulation tick.
         if let Some((min, max)) = outcome.changed {
             self.water.edited(&self.volume, &self.generator, min, max);
-            self.water.step(&self.volume, &self.generator);
         }
 
         let focus = self.focus.unwrap_or(DVec3::ZERO);
@@ -766,17 +787,35 @@ impl World {
 
     /// Let `volume` of water go at a finest-level cell; see [`Water::pour`].
     pub fn pour(&mut self, at: IVec3, volume: i64) {
-        self.water.pour(at, volume);
+        self.water.pour(at, volume, JOIN);
     }
 
     /// True when water has nothing more to do in the terrain that is loaded.
     pub fn water_at_rest(&self) -> bool {
-        self.water.at_rest(&self.volume)
+        self.water.at_rest()
     }
 
-    /// One simulation tick of water.
+    /// One simulation tick of water. Searches run on the worker pool and their
+    /// outcomes are applied at a fixed tick delay; if a worker has not finished
+    /// when its tick arrives, this waits so every machine stays identical.
     pub fn step_water(&mut self) {
-        self.water.step(&self.volume, &self.generator);
+        let (volume, log, store, regions, done_water) =
+            (&self.volume, &mut self.log, &self.store, &mut self.regions, &self.done_water);
+        let job = self.water.step(
+            || done_water.recv().expect("water worker exited"),
+            |req: &Request| {
+                if !req.loaded {
+                    let step = 1 << req.lod;
+                    let min = (req.origin * CHUNK_SIZE - APRON) * step;
+                    let max = ((req.origin + req.size) * CHUNK_SIZE + APRON) * step;
+                    load_regions(store.as_deref(), log, regions, CellPos::tier_of(req.lod), min, max);
+                }
+                Terrain::gather(volume, log, req)
+            },
+        );
+        if let Some(job) = job {
+            self.pool.push(URGENT, Job::Water(job));
+        }
         self.redraw_water(&mut IntSet::default());
     }
 
@@ -1194,6 +1233,28 @@ mod tests {
         assert!(drawing(&events, |b| b == BodyId::Pond(id))[0] >= 1);
         drop(world);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn water_on_workers_matches_across_thread_counts() {
+        let run = |workers: usize| {
+            let mut world = World::new(WorldParams::default(), StreamConfig { workers, ..config() }, None);
+            let mut events = Vec::new();
+            let here = ground(&world);
+            settle(&mut world, here, &mut events);
+            let cells = (here / world.params().cell_size as f64).floor().as_ivec3();
+            let at = |p: IVec3| [p.x as i64 * FP, p.y as i64 * FP, p.z as i64 * FP];
+            world.edit(&Op::Break { center: at(cells - IVec3::Y * 3), radius: 7 * FP, nearest: false });
+            world.pour(cells + IVec3::Y * 4, 2000 * FP);
+            for tick in 0..200 {
+                if tick == 80 {
+                    world.edit(&Op::Break { center: at(cells + IVec3::new(8, -3, 0)), radius: 6 * FP, nearest: false });
+                }
+                world.step_water();
+            }
+            world.water().encode()
+        };
+        assert_eq!(run(1), run(4), "worker count changed water state");
     }
 
     #[test]

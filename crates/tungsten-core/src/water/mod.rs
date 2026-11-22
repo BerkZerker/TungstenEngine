@@ -1,7 +1,8 @@
 //! Water as a function: bodies with one flat surface each, not a grid of cells.
 //!
 //! The ocean is a body with a fixed level: open ground below the sea level
-//! is under it, decided from the generator's height function alone.
+//! that is joined to a sea is under it, decided from the generator's height
+//! function alone. Low ground that is not is a dry hollow.
 //!
 //! This file holds what a node needs to draw the surfaces that pass through
 //! it. Surfaces are flat, so a node only says where each one is (a mask over
@@ -11,9 +12,10 @@
 pub mod bodies;
 pub mod cells;
 pub mod flood;
+pub mod job;
 
-use crate::coords::{CHUNK_SIZE, NodeKey};
-use crate::worldgen::{Generator, SEA_LEVEL};
+use crate::coords::{CHUNK_BITS, CHUNK_SIZE, NodeKey};
+use crate::worldgen::{Generator, SEA_GRID, SEA_LEVEL};
 
 /// A connected piece of water with one surface level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -62,12 +64,20 @@ pub fn mesh_mask(mut mask: Mask) -> (Vec<[u16; 2]>, Vec<u16>) {
     (vertices, indices)
 }
 
-/// The cells of a node with open ground below sea level at any corner. The
-/// terrain itself hides what part of such a cell is dry.
+/// The cells of a node with open ground below sea level at any corner, where
+/// that ground is joined to a sea. The terrain itself hides what part of
+/// such a cell is dry.
 fn ocean_mask(generator: &Generator, key: NodeKey) -> Mask {
     let heights = generator.heights(key.level, key.pos.x, key.pos.z);
     let mut mask = [0u32; N];
     if heights.min() >= SEA_LEVEL {
+        return mask;
+    }
+    // The node is this many sea cells across, each this many of its own.
+    const { assert!(SEA_GRID == CHUNK_SIZE) };
+    let (across, each) = (1 << key.level, CHUNK_BITS - key.level as i32);
+    let reached = generator.sea_cells(key.pos.x << key.level, key.pos.z << key.level, across);
+    if !reached.contains(&true) {
         return mask;
     }
     let mut above = [false; N + 1];
@@ -80,7 +90,8 @@ fn ocean_mask(generator: &Generator, key: NodeKey) -> Mask {
             *b = heights.at(x as i32, z as i32 + 1) < SEA_LEVEL;
         }
         for x in 0..N {
-            *row |= ((above[x] || above[x + 1] || below[x] || below[x + 1]) as u32) << x;
+            let sea = reached[(z >> each) * across as usize + (x >> each)];
+            *row |= ((sea && (above[x] || above[x + 1] || below[x] || below[x + 1])) as u32) << x;
         }
         above = below;
     }
@@ -93,7 +104,9 @@ fn ocean_mask(generator: &Generator, key: NodeKey) -> Mask {
 pub struct Surface {
     pub body: BodyId,
     pub level: i64,
-    /// Chunk column `(x, z)` at the finest level, and its wet columns.
+    /// The level of detail whose lattice the columns are on.
+    pub lod: u8,
+    /// Chunk column `(x, z)` at that level, and its wet columns.
     pub tiles: Vec<((i32, i32), Mask)>,
 }
 
@@ -103,27 +116,33 @@ pub struct NodeWater {
     pub surfaces: Vec<Surface>,
 }
 
-/// The cells of a node with a wet lattice column at any corner.
-fn cover(key: NodeKey, tiles: &[((i32, i32), Mask)]) -> Mask {
+/// The cells of a node that a surface's wet columns reach. A column of
+/// level of detail `lod` stands for the square of ground around its lattice
+/// point, one of that level's cells across; at the finest level that is the
+/// node cells with the point at a corner.
+fn cover(key: NodeKey, lod: u8, tiles: &[((i32, i32), Mask)]) -> Mask {
     let (o, step) = (key.origin(), key.step());
     let mut mask = [0u32; N];
-    // The node's cells on one axis that touch a lattice column: at most two.
+    let half = (1 << lod) >> 1;
+    // The node's cells on one axis that a column at base coordinate `r` from its origin reaches.
     let touched = |r: i32| {
-        let (a, b) = ((r - 1).div_euclid(step), r.div_euclid(step));
+        let (a, b) = match lod {
+            0 => ((r - 1).div_euclid(step), r.div_euclid(step)),
+            _ => ((r - half).div_euclid(step), (r + half - 1).div_euclid(step)),
+        };
         (a.max(0), b.min(N as i32 - 1))
     };
     for &((cx, cz), tile) in tiles {
         for (z, &row) in tile.iter().enumerate() {
-            let (z0, z1) = touched(cz * CHUNK_SIZE + z as i32 - o.z);
+            let (z0, z1) = touched(((cz * CHUNK_SIZE + z as i32) << lod) - o.z);
             let mut bits = row;
             while bits != 0 && z0 <= z1 {
                 let x = bits.trailing_zeros() as i32;
                 bits &= bits - 1;
-                let (x0, x1) = touched(cx * CHUNK_SIZE + x - o.x);
-                for z in z0..=z1 {
-                    for x in x0..=x1 {
-                        mask[z as usize] |= 1 << x;
-                    }
+                let (x0, x1) = touched(((cx * CHUNK_SIZE + x) << lod) - o.x);
+                if x0 <= x1 {
+                    let run = (u32::MAX >> (31 - (x1 - x0))) << x0;
+                    mask[z0 as usize..=z1 as usize].iter_mut().for_each(|m| *m |= run);
                 }
             }
         }
@@ -137,15 +156,25 @@ pub fn node_patches(generator: &Generator, key: NodeKey, water: &NodeWater) -> V
     let mut patches = Vec::new();
     let anchored = flood::anchor(bodies::SEA).div_euclid(key.size()) == key.pos.y;
     let mut sea = if anchored { ocean_mask(generator, key) } else { [0; N] };
+    // A body may contribute more than one surface (e.g. a sinking pond and its
+    // ebb footprint): merge their masks so overlapping cells are drawn once.
+    let mut bodies: Vec<(BodyId, i64, Mask)> = Vec::new();
     for surface in &water.surfaces {
-        let mask = cover(key, &surface.tiles);
+        let mask = cover(key, surface.lod, &surface.tiles);
         if surface.body == BodyId::Ocean {
             sea.iter_mut().zip(mask).for_each(|(row, more)| *row |= more);
             continue;
         }
+        if let Some((_, _, existing)) = bodies.iter_mut().find(|(b, _, _)| *b == surface.body) {
+            existing.iter_mut().zip(mask).for_each(|(row, more)| *row |= more);
+        } else {
+            bodies.push((surface.body, surface.level, mask));
+        }
+    }
+    for (body, level, mask) in bodies {
         let (vertices, indices) = mesh_mask(mask);
         if !indices.is_empty() {
-            patches.push(WaterPatch { body: surface.body, level: surface.level, vertices, indices });
+            patches.push(WaterPatch { body, level, vertices, indices });
         }
     }
     let (vertices, indices) = mesh_mask(sea);
@@ -203,7 +232,7 @@ mod tests {
         // A stretch across the shore 44 m east of the origin.
         for level in 0..=MAX_LEVEL {
             let spacing = cell * (1u64 << level) as f64;
-            let (mut wet, mut dry) = (0, 0);
+            let (mut wet, mut dry, mut hollow) = (0, 0, 0);
             let shore = (44.0 / (spacing * N as f64)).floor() as i32;
             for cx in shore - 2..=shore + 2 {
                 // The node just under the surface draws it, and no other.
@@ -225,14 +254,21 @@ mod tests {
                             let wx = (cx as i64 * N as i64 + (x + dx) as i64) as f64 * spacing;
                             g.surface_height(wx, (z + dz) as f64 * spacing)
                         };
-                        let under = [at(0, 0), at(1, 0), at(0, 1), at(1, 1)].iter().any(|&h| h < SEA_LEVEL);
+                        let low = [at(0, 0), at(1, 0), at(0, 1), at(1, 1)].iter().any(|&h| h < SEA_LEVEL);
+                        // Low ground is under the sea only where it is joined to one.
+                        let sea =
+                            ((cx * CHUNK_SIZE + x as i32) << level >> CHUNK_BITS, (z as i32) << level >> CHUNK_BITS);
+                        let under = low && g.sea_reaches(sea.0, sea.1);
                         assert_eq!(times == 1, under, "level {level} node {cx} cell {x} {z}");
                         wet += under as u32;
-                        dry += !under as u32;
+                        dry += !low as u32;
+                        hollow += (low && !under) as u32;
                     }
                 }
             }
             assert!(wet > 200 && dry > 200, "level {level}: {wet} wet, {dry} dry");
+            // The widest stretch takes in a hollow that no sea reaches.
+            assert_eq!(hollow > 0, level == MAX_LEVEL, "level {level}: {hollow} cells of dry hollow");
         }
     }
 }

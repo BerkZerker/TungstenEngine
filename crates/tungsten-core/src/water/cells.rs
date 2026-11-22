@@ -2,6 +2,7 @@
 //! that have any.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use glam::IVec3;
 
@@ -19,9 +20,11 @@ fn key(chunk: IVec3) -> Key {
     [chunk.y, chunk.z, chunk.x]
 }
 
+/// Cloning one copies no bits until either copy is changed, so a snapshot
+/// can be handed to a worker for nothing.
 #[derive(Clone, Default, Debug)]
 pub struct Cells {
-    chunks: BTreeMap<Key, Box<[u64; WORDS]>>,
+    chunks: BTreeMap<Key, Arc<[u64; WORDS]>>,
     len: usize,
     /// Bounds of every cell ever inserted; not shrunk by removal.
     bounds: Option<(IVec3, IVec3)>,
@@ -75,7 +78,7 @@ impl Cells {
     /// Add a cell. True if it was not there.
     pub fn insert(&mut self, p: IVec3) -> bool {
         let i = index(local_of(p));
-        let bits = self.chunks.entry(key(chunk_of(p))).or_insert_with(|| Box::new([0; WORDS]));
+        let bits = Arc::make_mut(self.chunks.entry(key(chunk_of(p))).or_insert_with(|| Arc::new([0; WORDS])));
         let new = bits[i >> 6] >> (i & 63) & 1 == 0;
         bits[i >> 6] |= 1 << (i & 63);
         self.len += new as usize;
@@ -89,6 +92,10 @@ impl Cells {
         let (k, i) = (key(chunk_of(p)), index(local_of(p)));
         let Some(bits) = self.chunks.get_mut(&k) else { return false };
         let was = bits[i >> 6] >> (i & 63) & 1 == 1;
+        if !was {
+            return false;
+        }
+        let bits = Arc::make_mut(bits);
         bits[i >> 6] &= !(1 << (i & 63));
         self.len -= was as usize;
         if was && bits.iter().all(|&w| w == 0) {

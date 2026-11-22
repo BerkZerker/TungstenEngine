@@ -13,7 +13,8 @@ use tungsten_core::edit::{EditRules, FP, Op, edit_volume};
 use tungsten_core::field::LocalField;
 use tungsten_core::hash::fnv1a;
 use tungsten_core::log::{CellPos, EditLog, bake, resolve};
-use tungsten_core::water::bodies::Water;
+use tungsten_core::water::bodies::{DELAY, JOIN, Water};
+use tungsten_core::water::job::{Outcome, Terrain};
 use tungsten_core::worldgen::{GENERATOR_VERSION, Generator};
 use tungsten_core::{MAX_LEVEL, NodeKey, Volume, WorldParams};
 
@@ -22,7 +23,7 @@ const EDITED: u64 = 0x37c3dd5efb1f4d93;
 const RESOLVED: u64 = 0x88b617e9558fa8d1;
 const SAVED: u64 = 0x6fabf7af924c70be;
 const BAKED: u64 = 0xff72da7184c9c3d7;
-const WATER: u64 = 0x8cf5fe850ad536ce;
+const WATER: u64 = 0x74d645c02f86d0ff;
 
 fn worlds() -> [WorldParams; 2] {
     [WorldParams::default(), WorldParams { seed: 12345, cell_size: 0.5, min_fragment: 0.75 }]
@@ -193,32 +194,54 @@ fn water_matches_golden_hash() {
                 let pos = chunk_of(here) + IVec3::new(i % 5, i / 25, i / 5 % 5) - 2;
                 volume.insert(pos, block(&generator, NodeKey::new(0, pos)).interior());
             }
+            let mut log = EditLog::new();
             let mut water = Water::new();
-            let edit = |water: &mut Water, volume: &mut Volume, at: IVec3, radius: i64, place: bool| {
-                let center = [at.x as i64 * FP, at.y as i64 * FP, at.z as i64 * FP];
-                let op = match place {
-                    true => Op::Place { center, radius: radius * FP, material: 3, exclude: None },
-                    false => Op::Break { center, radius: radius * FP, nearest: false },
-                };
-                if let Some((min, max)) = edit_volume(volume, &rules, &op).changed {
-                    water.edited(volume, &generator, min, max);
-                }
-            };
-            let pit = here - IVec3::Y * 4;
-            for step in 0..240 {
-                match step {
-                    0 => edit(&mut water, &mut volume, pit, 7, false),
-                    5 => water.pour(here + IVec3::Y * 5, 250 * FP),
-                    40 => edit(&mut water, &mut volume, pit + IVec3::new(8, -1, 2), 6, false),
-                    70 => edit(&mut water, &mut volume, pit + IVec3::new(-2, -5, 0), 4, true),
-                    100 => water.pour(here + IVec3::new(3, 6, -2), 3000 * FP),
-                    // Towards the sea, where there is one within reach.
-                    130..=150 if step % 4 == 0 => {
-                        edit(&mut water, &mut volume, pit + IVec3::new(2 * (step - 126), 0, 0), 5, false)
+            let mut pending: Option<(u64, Outcome)> = None;
+            let edit =
+                |water: &mut Water, volume: &mut Volume, log: &mut EditLog, at: IVec3, radius: i64, place: bool| {
+                    let center = [at.x as i64 * FP, at.y as i64 * FP, at.z as i64 * FP];
+                    let op = match place {
+                        true => Op::Place { center, radius: radius * FP, material: 3, exclude: None },
+                        false => Op::Break { center, radius: radius * FP, nearest: false },
+                    };
+                    log.push(&rules, &op);
+                    if let Some((min, max)) = edit_volume(volume, &rules, &op).changed {
+                        water.edited(volume, &generator, min, max);
                     }
+                };
+            let pit = here - IVec3::Y * 4;
+            for step in 0u64..300 {
+                match step {
+                    0 => edit(&mut water, &mut volume, &mut log, pit, 7, false),
+                    5 => water.pour(here + IVec3::Y * 5, 250 * FP, JOIN),
+                    40 => edit(&mut water, &mut volume, &mut log, pit + IVec3::new(8, -1, 2), 6, false),
+                    70 => edit(&mut water, &mut volume, &mut log, pit + IVec3::new(-2, -5, 0), 4, true),
+                    100 => water.pour(here + IVec3::new(3, 6, -2), 3000 * FP, JOIN),
+                    // Towards the sea, where there is one within reach.
+                    130..=150 if step % 4 == 0 => edit(
+                        &mut water,
+                        &mut volume,
+                        &mut log,
+                        pit + IVec3::new(2 * (step as i32 - 126), 0, 0),
+                        5,
+                        false,
+                    ),
                     _ => {}
                 }
-                water.step(&volume, &generator);
+                let tick = step + 1;
+                let mut found = pending.take();
+                let job = water.step(
+                    || {
+                        let (started, outcome) = found.take().expect("no search in flight");
+                        assert_eq!(tick, started + DELAY);
+                        outcome
+                    },
+                    |req| Terrain::gather(&volume, &log, req),
+                );
+                pending = found;
+                if let Some(job) = job {
+                    pending = Some((tick, job.run(&generator, &rules)));
+                }
             }
             let stats = water.stats();
             assert_eq!(stats.held + stats.moving + stats.drained + stats.lost, 3250 * FP, "water was not conserved");

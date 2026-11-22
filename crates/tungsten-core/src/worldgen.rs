@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use crate::chunk::Sample;
 use crate::coords::{APRON, CHUNK_SIZE, FILL_PER_CELL, NodeKey, PAD, WorldParams};
 use crate::field::LocalField;
-use crate::hash::{IntMap, derive};
+use crate::hash::{IntMap, IntSet, derive};
 use crate::material::Material;
 use crate::noise::{fbm2, noise2, noise3, ridged2, smoothstep};
 
@@ -150,10 +150,26 @@ impl Lattice {
     }
 }
 
+/// Whether ground below sea level is joined to a sea is decided for whole
+/// cells this many base cells across: the columns of the finest chunks.
+pub const SEA_GRID: i32 = CHUNK_SIZE;
+/// Cells that low ground has to pass through, one to the next, before it is
+/// a sea. Anything smaller is a dry hollow. At the default cell size this
+/// is 1.6 hectares, an eighth of a kilometre across.
+pub const SEA_CELLS: usize = 256;
+/// Sea cells along the side of a cached tile.
+const SEA_TILE: i32 = 32;
+type SeaTile = Arc<[u32; SEA_TILE as usize]>;
+/// Base cells between the points of a cell's side at which the ground is
+/// looked at: low ground narrower than this may pass between them unseen.
+const SEA_STEP: i32 = 4;
+
 pub struct Generator {
     params: WorldParams,
     seeds: Seeds,
     columns: Mutex<IntMap<(u8, i32, i32), Arc<Column>>>,
+    /// For each tile of the sea lattice, its points that are in a sea: bit `x` of row `z`.
+    seas: Mutex<IntMap<(i32, i32), SeaTile>>,
 }
 
 impl Generator {
@@ -177,6 +193,7 @@ impl Generator {
                 cave3: s(14),
             },
             columns: Mutex::new(IntMap::default()),
+            seas: Mutex::new(IntMap::default()),
         }
     }
 
@@ -194,6 +211,114 @@ impl Generator {
         let ridge = ridged2(s.ridge, x / RIDGE_WAVE, z / RIDGE_WAVE, 4);
         let detail = fbm2(s.detail, x / 36.0, z / 36.0, 3);
         cont * 40.0 + hills * 14.0 + mask * ridge * MOUNTAIN_HEIGHT + detail * 1.2
+    }
+
+    /// True if the ground is below sea level somewhere along a side of sea
+    /// cell `(i, j)`: its side towards -Z if `along_x`, towards -X if not.
+    fn low_side(&self, i: i32, j: i32, along_x: bool) -> bool {
+        let cell = self.params.cell_size as f64;
+        (0..=SEA_GRID / SEA_STEP).any(|k| {
+            let (dx, dz) = if along_x { (k * SEA_STEP, 0) } else { (0, k * SEA_STEP) };
+            let (x, z) = (i as i64 * SEA_GRID as i64 + dx as i64, j as i64 * SEA_GRID as i64 + dz as i64);
+            self.surface_height(x as f64 * cell, z as f64 * cell) < SEA_LEVEL
+        })
+    }
+
+    /// Which cells of a tile are in a sea: those from which ground below sea
+    /// level runs on, from cell to neighbouring cell across a side that is
+    /// low somewhere, through at least [`SEA_CELLS`] of them. That depends
+    /// on nothing but the height function, so it is the same wherever it is
+    /// asked from.
+    fn sea_tile(&self, tx: i32, tz: i32) -> SeaTile {
+        if let Some(t) = self.seas.lock().unwrap().get(&(tx, tz)) {
+            return t.clone();
+        }
+        const N: i32 = SEA_TILE;
+        let (i0, j0) = (tx * N, tz * N);
+        let mut sea = [0u32; N as usize];
+        let mut done = [0u32; N as usize];
+        // Low or not, for every side looked at, in or out of the tile.
+        let mut sides: IntMap<(i32, i32, bool), bool> = IntMap::default();
+        let mut queue: Vec<(i32, i32)> = Vec::new();
+        for z in 0..N {
+            for x in 0..N {
+                if done[z as usize] >> x & 1 == 1 {
+                    continue;
+                }
+                // Follow the low ground from here until it is seen to be a
+                // sea, or there is no more of it.
+                queue.clear();
+                queue.push((i0 + x, j0 + z));
+                let mut seen: IntSet<(i32, i32)> = IntSet::default();
+                seen.insert((i0 + x, j0 + z));
+                let (mut next, mut is_sea) = (0, false);
+                while next < queue.len() && !is_sea {
+                    let (i, j) = queue[next];
+                    next += 1;
+                    // Each neighbour, and the side shared with it.
+                    for (q, side) in [
+                        ((i - 1, j), (i, j, false)),
+                        ((i + 1, j), (i + 1, j, false)),
+                        ((i, j - 1), (i, j, true)),
+                        ((i, j + 1), (i, j + 1, true)),
+                    ] {
+                        if seen.contains(&q)
+                            || !*sides.entry(side).or_insert_with(|| self.low_side(side.0, side.1, side.2))
+                        {
+                            continue;
+                        }
+                        let (lx, lz) = (q.0 - i0, q.1 - j0);
+                        if (0..N).contains(&lx) && (0..N).contains(&lz) && done[lz as usize] >> lx & 1 == 1 {
+                            // Joined to ground that is already decided, which
+                            // can only be a sea: one left dry was followed to its end.
+                            is_sea = true;
+                            break;
+                        }
+                        seen.insert(q);
+                        queue.push(q);
+                    }
+                    is_sea |= queue.len() >= SEA_CELLS;
+                }
+                for &(i, j) in &queue {
+                    let (lx, lz) = (i - i0, j - j0);
+                    if (0..N).contains(&lx) && (0..N).contains(&lz) {
+                        done[lz as usize] |= 1 << lx;
+                        sea[lz as usize] |= (is_sea as u32) << lx;
+                    }
+                }
+            }
+        }
+        let tile = Arc::new(sea);
+        let mut cache = self.seas.lock().unwrap();
+        if cache.len() > 4000 {
+            cache.clear();
+        }
+        cache.insert((tx, tz), tile.clone());
+        tile
+    }
+
+    /// For the square of `n` by `n` sea cells from `(ci, cj)`, row by row,
+    /// whether open ground below sea level in each is under the sea. Other
+    /// low ground is a dry hollow until something joins it to a sea.
+    pub fn sea_cells(&self, ci: i32, cj: i32, n: i32) -> Vec<bool> {
+        let mut out = Vec::with_capacity((n * n) as usize);
+        let mut tile: Option<((i32, i32), SeaTile)> = None;
+        for j in cj..cj + n {
+            for i in ci..ci + n {
+                let t = (i.div_euclid(SEA_TILE), j.div_euclid(SEA_TILE));
+                if tile.as_ref().is_none_or(|(at, _)| *at != t) {
+                    tile = Some((t, self.sea_tile(t.0, t.1)));
+                }
+                let bits = &tile.as_ref().unwrap().1;
+                out.push(bits[j.rem_euclid(SEA_TILE) as usize] >> i.rem_euclid(SEA_TILE) & 1 == 1);
+            }
+        }
+        out
+    }
+
+    /// [`sea_cells`](Self::sea_cells) for one cell.
+    pub fn sea_reaches(&self, ci: i32, cj: i32) -> bool {
+        self.sea_cells(ci, cj, 1)[0]
     }
 
     /// Heights the terrain surface can reach, metres: lowest valley floor to highest peak.
