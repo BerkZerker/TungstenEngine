@@ -138,8 +138,7 @@ mod tests {
     #[test]
     fn flat_ground_gives_upward_triangles_at_the_surface() {
         let dims = IVec3::new(6, 6, 6);
-        let n = 216;
-        let mut field = LocalField { origin: IVec3::ZERO, dims, fill: vec![0; n], mat: vec![0; n] };
+        let mut field = LocalField::new(IVec3::ZERO, dims, 0);
         // Solid below y = 2.5.
         for y in 0..6 {
             for z in 0..6 {

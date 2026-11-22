@@ -1,240 +1,269 @@
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use glam::IVec3;
-use tungsten_core::codec::{self, Decoded};
-use tungsten_core::coords::{CHUNK_BITS, CHUNK_MASK, chunk_origin, index, local_of};
-use tungsten_core::edit::{self, EditOp, EditOutcome, EditRules};
+use glam::{DVec3, IVec3};
+use tungsten_core::coords::{APRON, CHUNK_SIZE, LEVELS, MAX_LEVEL, NodeKey, chunk_of};
+use tungsten_core::edit::{self, EditOutcome, EditRules, Op};
+use tungsten_core::field::LocalField;
 use tungsten_core::hash::{IntMap, IntSet};
-use tungsten_core::mesh::{ChunkMesh, PaddedBlock, mesh_block};
-use tungsten_core::sand::SandSim;
-use tungsten_core::worldgen::Generator;
+use tungsten_core::log::{self, Baked, CellEdits, CellPos, CellSet, EditLog, TIERS};
+use tungsten_core::mesh::{ChunkMesh, mesh_block};
+use tungsten_core::worldgen::{Generated, Generator};
 use tungsten_core::{Chunk, ChunkPos, Volume, WorldParams};
 
 use crate::pool::Pool;
-use crate::store::Store;
+use crate::store::{REGION_BITS, RegionPos, Store};
 
 #[derive(Clone, Copy, Debug)]
 pub struct StreamConfig {
-    /// Horizontal radius, in chunks, inside which chunks are meshed.
-    pub radius_h: i32,
-    /// Vertical radius, in chunks, inside which chunks are meshed.
-    pub radius_v: i32,
+    /// Metres of terrain drawn around the focus.
+    pub view_distance: f32,
+    /// A node is split into finer ones while the focus is within this many
+    /// of its own lengths. Higher draws fine detail further out.
+    pub detail: f32,
     pub workers: usize,
-    /// Chunks considered for meshing per update at most; bounds main-thread time.
-    pub mesh_starts_per_update: usize,
+    /// An edit cell is baked once it holds this many ops.
+    pub bake_ops: usize,
 }
 
 impl Default for StreamConfig {
     fn default() -> Self {
         let cores = std::thread::available_parallelism().map_or(4, |n| n.get());
-        Self { radius_h: 12, radius_v: 6, workers: cores.saturating_sub(2).max(1), mesh_starts_per_update: 512 }
+        Self { view_distance: 2048.0, detail: 2.0, workers: cores.saturating_sub(2).max(1), bake_ops: 512 }
     }
 }
 
-/// A change to what should be drawn.
+/// A change to what should be drawn. Events must be applied in order.
 pub enum MeshEvent {
     /// `urgent` marks the result of an edit, which must reach the screen
     /// together with the rest of its group and without delay.
-    Upload {
-        pos: ChunkPos,
-        mesh: ChunkMesh,
-        urgent: bool,
-    },
-    Remove {
-        pos: ChunkPos,
-        urgent: bool,
-    },
+    Upload { key: NodeKey, mesh: ChunkMesh, urgent: bool },
+    /// The node no longer has a mesh.
+    Remove { key: NodeKey, urgent: bool },
+    /// Which nodes are on screen changed. Nodes are hidden until shown. To be
+    /// applied whole: taking half would leave a hole or draw ground twice.
+    Visible { show: Vec<NodeKey>, hide: Vec<NodeKey> },
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Stats {
-    pub loading: usize,
-    pub loaded: usize,
-    pub dense: usize,
+    pub nodes: usize,
+    /// Nodes with a mesh, on screen or held in reserve.
     pub meshed: usize,
-    pub awaiting_mesh: usize,
+    /// Nodes on screen, by level.
+    pub drawn: [u32; LEVELS],
+    /// Finest-level chunks held for collision and editing, and how many are not uniform.
+    pub chunks: usize,
+    pub dense: usize,
     pub jobs_queued: usize,
     pub jobs_running: usize,
+    /// Edit cells with edits, ops in them, and cells baked this session.
+    pub cells: usize,
+    pub ops: usize,
+    pub bakes: usize,
 }
 
 enum Job {
-    Generate(ChunkPos),
-    /// Free unloaded chunks off the main thread.
-    Release(Vec<Arc<Chunk>>),
-    /// The chunk and its 26 neighbours, indexed as `neighbours()` yields them.
+    /// Generate a node's block, resolve the edits in `cells` and mesh it.
+    Node {
+        key: NodeKey,
+        version: u64,
+        group: u32,
+        cells: CellSet,
+    },
+    /// Remesh a finest-level node from its chunk and 26 neighbours, indexed
+    /// as `neighbours()` yields them.
     Mesh {
-        pos: ChunkPos,
-        version: u32,
+        key: NodeKey,
+        version: u64,
         group: u32,
         chunks: Box<[Arc<Chunk>; 27]>,
     },
+    Bake {
+        cell: CellPos,
+        edits: Arc<CellEdits>,
+    },
+    /// Free unloaded chunks off the main thread.
+    Release(Vec<Arc<Chunk>>),
 }
 
 enum Done {
-    /// A generated chunk, with its saved edits already overlaid.
-    Generated(ChunkPos, Chunk, Option<Decoded>),
-    Meshed {
-        pos: ChunkPos,
-        version: u32,
-        group: u32,
-        mesh: ChunkMesh,
-    },
+    /// A mesh and, from a finest-level `Job::Node`, the chunk it was made from.
+    Node { key: NodeKey, version: u64, group: u32, mesh: ChunkMesh, chunk: Option<Chunk> },
+    /// The overlay that replaces the first `ops` ops of a cell.
+    Baked { cell: CellPos, ops: usize, baked: Baked },
 }
 
-struct Entry {
-    loaded: bool,
-    /// Bumped whenever this chunk's block (own samples or apron) changes.
-    version: u32,
-    /// Version a mesh job was last started for.
-    requested: Option<u32>,
-    /// Version currently on screen.
-    shown: Option<u32>,
+struct Node {
+    /// Changes whenever the samples behind this node's mesh do. Never reused.
+    version: u64,
+    /// Version a job was last started for.
+    requested: Option<u64>,
+    /// Version of the mesh the renderer holds (which may be no mesh at all).
+    shown: Option<u64>,
     has_mesh: bool,
+    /// Part of the tree the focus currently asks for.
+    wanted: bool,
+    /// Wanted as finer nodes rather than as itself.
+    refine: bool,
+    /// How many of its eight finer nodes exist.
+    children: u8,
+    /// All eight exist and can be drawn without a hole; as of the last `redraw`.
+    children_cover: bool,
+    /// The renderer has been told to draw it.
+    drawn: bool,
+    /// Scratch for `redraw`.
+    marked: bool,
 }
 
 /// Meshes of one edit, held back until all have arrived so they swap in together.
 struct Group {
     remaining: usize,
-    meshes: Vec<(ChunkPos, u32, ChunkMesh)>,
+    meshes: Vec<(NodeKey, u64, ChunkMesh)>,
 }
 
 const URGENT: u64 = 0;
+const IDLE: u64 = u64::MAX;
+/// Priority offset of meshes that only stand in while finer ones load.
+const STAND_IN: u64 = 1 << 32;
 /// Main-thread time per update for accepting finished streaming work.
 const COLLECT_BUDGET: std::time::Duration = std::time::Duration::from_micros(1500);
+/// Base cells the focus moves before the tree is looked at again.
+const RETARGET: f64 = 8.0;
 
 pub struct World {
     params: WorldParams,
     rules: EditRules,
     config: StreamConfig,
     generator: Arc<Generator>,
+    /// The finest level around the focus, with every edit applied.
     volume: Volume,
-    sand: SandSim,
+    log: EditLog,
     store: Option<Arc<Store>>,
-    /// Chunks changed since they were last handed to the store.
-    unsaved: IntSet<ChunkPos>,
-    entries: IntMap<ChunkPos, Entry>,
+    /// Regions whose saved cells are in the log.
+    regions: IntSet<RegionPos>,
+    nodes: IntMap<NodeKey, Node>,
+    /// The coarsest nodes in view.
+    roots: Vec<NodeKey>,
     pool: Pool<Job>,
     done: Receiver<Done>,
     /// Results of edit remeshes, kept apart so streaming cannot delay them.
     done_urgent: Receiver<Done>,
-    center: Option<ChunkPos>,
-    /// Offsets to mesh, nearest first.
-    mesh_offsets: Vec<IVec3>,
-    mesh_set: IntSet<IVec3>,
-    /// Offsets to hold data for: the mesh set plus its neighbours.
-    data_offsets: Vec<IVec3>,
-    /// Offsets kept loaded once present: one ring of hysteresis beyond data.
-    keep_set: IntSet<IVec3>,
-    /// Chunks whose mesh may need (re)starting.
-    check: VecDeque<ChunkPos>,
-    queued_check: IntSet<ChunkPos>,
+    /// Focus in base cells, as of the last look at the tree.
+    focus: Option<DVec3>,
     groups: IntMap<u32, Group>,
     next_group: u32,
-    loading: usize,
+    next_version: u64,
+    /// Cells with a bake under way.
+    baking: IntSet<CellPos>,
+    bakes: usize,
     meshed: usize,
+    /// The set of nodes may need to change.
+    tree_dirty: bool,
+    /// What is drawn may need to change.
+    drawn_dirty: bool,
+    drawn_levels: [u32; LEVELS],
 }
 
 fn neighbours() -> impl Iterator<Item = IVec3> {
     (-1..=1).flat_map(|y| (-1..=1).flat_map(move |z| (-1..=1).map(move |x| IVec3::new(x, y, z))))
 }
 
-fn dilate(set: &IntSet<IVec3>) -> IntSet<IVec3> {
-    set.iter().flat_map(|&p| neighbours().map(move |n| p + n)).collect()
+/// Distance in base cells from a point to a node's box.
+fn distance(key: NodeKey, focus: DVec3) -> f64 {
+    let min = key.origin().as_dvec3();
+    let max = min + key.size() as f64;
+    (min - focus).max(focus - max).max(DVec3::ZERO).length()
 }
 
-fn dist_key(offset: IVec3) -> u64 {
-    // Vertical distance counts double: the load volume is flattened.
-    let d = offset * IVec3::new(1, 2, 1);
-    1 + d.length_squared() as u64
+/// Job priority: nearest first, measured in the node's own lengths so that
+/// every level fills in from the focus outwards together.
+fn priority(key: NodeKey, focus: DVec3, stand_in: bool) -> u64 {
+    1 + (distance(key, focus) / key.size() as f64 * 64.0) as u64 + if stand_in { STAND_IN } else { 0 }
 }
 
-fn sorted(set: &IntSet<IVec3>) -> Vec<IVec3> {
-    let mut v: Vec<IVec3> = set.iter().copied().collect();
-    v.sort_by_key(|&o| (dist_key(o), o.x, o.y, o.z));
-    v
+/// Call `f` for every chunk position in `[min, max]`.
+fn for_box(min: IVec3, max: IVec3, mut f: impl FnMut(IVec3)) {
+    for y in min.y..=max.y {
+        for z in min.z..=max.z {
+            for x in min.x..=max.x {
+                f(IVec3::new(x, y, z));
+            }
+        }
+    }
 }
 
 impl World {
-    /// With a `store`, saved edits are loaded with their chunks and edits are
-    /// written back when chunks unload and on [`save`](Self::save).
+    /// With a `store`, saved edits are loaded as their region comes into use
+    /// and new ones are written back on [`save`](Self::save).
     pub fn new(params: WorldParams, config: StreamConfig, store: Option<Arc<Store>>) -> Self {
         let generator = Arc::new(Generator::new(params));
+        let rules = EditRules::new(&params);
         let (tx, done): (Sender<Done>, _) = unbounded();
         let (tx_urgent, done_urgent): (Sender<Done>, _) = unbounded();
         let worker_gen = generator.clone();
-        let worker_store = store.clone();
         let pool = Pool::new(config.workers, move |job: Job| {
             let result = match job {
                 Job::Release(chunks) => {
                     drop(chunks);
                     return;
                 }
-                Job::Generate(pos) => {
-                    let mut chunk = worker_gen.generate(pos);
-                    let saved = worker_store.as_ref().and_then(|s| s.get(pos)).and_then(|bytes| {
-                        // A delta that cannot be read leaves the generated chunk as it is.
-                        codec::apply(&mut chunk, &bytes)
-                            .map_err(|e| eprintln!("tungsten: saved chunk {pos} is unreadable ({e}); regenerated"))
-                            .ok()
+                Job::Node { key, version, group, cells } => {
+                    let mut block = LocalField::block(key);
+                    let generated = worker_gen.fill_block(key, &mut block);
+                    log::resolve(&mut block, &rules, &cells);
+                    let untouched = |s| matches!(generated, Generated::Uniform(u) if u == s) && cells.is_empty();
+                    // Coarse nodes overlap their neighbours; see `mesh_block`.
+                    let margin = (key.level > 0) as i32;
+                    let mesh = match generated {
+                        Generated::Uniform(_) if cells.is_empty() => ChunkMesh::default(),
+                        _ => mesh_block(&block, margin),
+                    };
+                    let chunk = (key.level == 0).then(|| match generated {
+                        Generated::Uniform(s) if untouched(s) => Chunk::Uniform(s),
+                        _ => block.interior(),
                     });
-                    Done::Generated(pos, chunk, saved)
+                    Done::Node { key, version, group, mesh, chunk }
                 }
-                Job::Mesh { pos, version, group, chunks } => {
+                Job::Mesh { key, version, group, chunks } => {
                     // Copying 27 chunks into a block is the expensive part of
                     // starting a mesh, so it happens here, not on the main thread.
-                    let block = PaddedBlock::gather(pos, |p| {
-                        let d = p - pos + 1;
-                        Some(&*chunks[((d.y * 3 + d.z) * 3 + d.x) as usize])
-                    })
-                    .expect("all 27 chunks are present");
-                    Done::Meshed { pos, version, group, mesh: mesh_block(&block) }
+                    let block = LocalField::gather(key, &chunks);
+                    Done::Node { key, version, group, mesh: mesh_block(&block, 0), chunk: None }
+                }
+                Job::Bake { cell, edits } => {
+                    Done::Baked { cell, ops: edits.ops.len(), baked: log::bake(&worker_gen, &rules, cell, &edits) }
                 }
             };
             // The receiver is gone only during shutdown.
-            let urgent = matches!(result, Done::Meshed { group, .. } if group != 0);
+            let urgent = matches!(result, Done::Node { group, .. } if group != 0);
             let _ = if urgent { tx_urgent.send(result) } else { tx.send(result) };
         });
 
-        let (rh, rv) = (config.radius_h.max(1), config.radius_v.max(1));
-        let mut mesh_set = IntSet::default();
-        for y in -rv..=rv {
-            for z in -rh..=rh {
-                for x in -rh..=rh {
-                    let (fx, fy, fz) = (x as f32 / rh as f32, y as f32 / rv as f32, z as f32 / rh as f32);
-                    if fx * fx + fy * fy + fz * fz <= 1.0 {
-                        mesh_set.insert(IVec3::new(x, y, z));
-                    }
-                }
-            }
-        }
-        let data_set = dilate(&mesh_set);
-        let keep_set = dilate(&data_set);
         Self {
             params,
-            rules: EditRules::new(&params),
+            rules,
             config,
             generator,
             volume: Volume::new(),
-            sand: SandSim::new(),
+            log: EditLog::new(),
             store,
-            unsaved: IntSet::default(),
-            entries: IntMap::default(),
+            regions: IntSet::default(),
+            nodes: IntMap::default(),
+            roots: Vec::new(),
             pool,
             done,
             done_urgent,
-            center: None,
-            mesh_offsets: sorted(&mesh_set),
-            mesh_set,
-            data_offsets: sorted(&data_set),
-            keep_set,
-            check: VecDeque::new(),
-            queued_check: IntSet::default(),
+            focus: None,
             groups: IntMap::default(),
             next_group: 1,
-            loading: 0,
+            next_version: 1,
+            baking: IntSet::default(),
+            bakes: 0,
             meshed: 0,
+            tree_dirty: false,
+            drawn_dirty: false,
+            drawn_levels: [0; LEVELS],
         }
     }
 
@@ -254,7 +283,11 @@ impl World {
         &self.volume
     }
 
-    /// True once the chunk and its 26 neighbours hold data.
+    pub fn log(&self) -> &EditLog {
+        &self.log
+    }
+
+    /// True once the finest-level chunk and its 26 neighbours hold data.
     pub fn neighbourhood_loaded(&self, pos: ChunkPos) -> bool {
         neighbours().all(|n| self.volume.chunks.contains_key(&(pos + n)))
     }
@@ -262,100 +295,205 @@ impl World {
     pub fn stats(&self) -> Stats {
         let (jobs_queued, jobs_running) = self.pool.load();
         Stats {
-            loading: self.loading,
-            loaded: self.volume.chunks.len(),
-            dense: self.volume.chunks.values().filter(|c| !c.is_uniform()).count(),
+            nodes: self.nodes.len(),
             meshed: self.meshed,
-            awaiting_mesh: self.check.len(),
+            drawn: self.drawn_levels,
+            chunks: self.volume.chunks.len(),
+            dense: self.volume.chunks.values().filter(|c| !c.is_uniform()).count(),
             jobs_queued,
             jobs_running,
+            cells: self.log.cell_count(),
+            ops: self.log.op_count(),
+            bakes: self.bakes,
         }
     }
 
-    /// True when every chunk in range is loaded and every mesh is current.
+    /// True when nothing is being generated, meshed or baked and nothing is
+    /// waiting to be shown.
     pub fn settled(&self) -> bool {
         let (q, r) = self.pool.load();
-        self.center.is_some()
+        self.focus.is_some()
             && q == 0
             && r == 0
-            && self.loading == 0
-            && self.check.is_empty()
             && self.done.is_empty()
             && self.done_urgent.is_empty()
+            && !self.tree_dirty
+            && !self.drawn_dirty
     }
 
-    fn queue_check(&mut self, pos: ChunkPos) {
-        if self.queued_check.insert(pos) {
-            self.check.push_back(pos);
+    /// Advance streaming around `focus`, a position in metres. Mesh changes
+    /// are appended to `events`.
+    pub fn update(&mut self, focus: DVec3, events: &mut Vec<MeshEvent>) {
+        let focus = focus / self.params.cell_size as f64;
+        let moved = self.focus.is_none_or(|f| (f - focus).abs().max_element() >= RETARGET);
+        if moved {
+            self.focus = Some(focus);
         }
-    }
-
-    /// Advance streaming around `focus`. Mesh changes are appended to `events`.
-    pub fn update(&mut self, focus: ChunkPos, events: &mut Vec<MeshEvent>) {
-        if self.center != Some(focus) {
-            self.recenter(focus, events);
+        if moved || self.tree_dirty {
+            self.retarget(moved, events);
         }
         self.collect(events);
-        self.start_meshes(events);
+        if self.tree_dirty {
+            self.retarget(false, events);
+        }
+        if self.drawn_dirty {
+            self.redraw(events);
+        }
     }
 
-    fn recenter(&mut self, focus: ChunkPos, events: &mut Vec<MeshEvent>) {
-        self.center = Some(focus);
-
-        // Unload what fell outside the hysteresis ring.
-        let keep = &self.keep_set;
-        let drop: Vec<ChunkPos> = self.entries.keys().filter(|&&p| !keep.contains(&(p - focus))).copied().collect();
-        let mut released = Vec::new();
-        for pos in drop {
-            let e = self.entries.remove(&pos).unwrap();
-            if e.loaded {
-                self.persist(pos, true);
-                released.extend(self.volume.chunks.remove(&pos));
-                self.volume.touched.remove(&pos);
-            } else {
-                self.loading -= 1;
+    /// Load the saved edits of every region of `tier` overlapping base-cell
+    /// bounds `[min, max]`.
+    fn ensure_regions(&mut self, tier: u8, min: IVec3, max: IVec3) {
+        let Some(store) = &self.store else { return };
+        let shift = CellPos::bits(tier) + REGION_BITS;
+        let (log, regions) = (&mut self.log, &mut self.regions);
+        for_box(min >> shift, max >> shift, |r| {
+            if !regions.insert((tier, r)) {
+                return;
             }
-            if e.has_mesh {
-                self.meshed -= 1;
-                events.push(MeshEvent::Remove { pos, urgent: false });
-            }
-        }
-
-        if !released.is_empty() {
-            self.pool.push(u64::MAX, Job::Release(released));
-        }
-
-        // Re-prioritise what is still queued; drop jobs for unloaded chunks.
-        let entries = &self.entries;
-        self.pool.rekey(|job| match job {
-            Job::Release(_) => Some(u64::MAX),
-            Job::Generate(pos) => entries.contains_key(pos).then(|| dist_key(*pos - focus)),
-            Job::Mesh { pos, group, .. } => {
-                if *group != 0 {
-                    Some(URGENT)
-                } else {
-                    entries.contains_key(pos).then(|| dist_key(*pos - focus))
+            for (pos, bytes) in store.region((tier, r)) {
+                match CellEdits::decode(&bytes) {
+                    Ok(edits) => log.insert(pos, edits),
+                    // Edits that cannot be read leave the generated terrain as it is.
+                    Err(e) => eprintln!("tungsten: saved edits of cell {pos:?} are unreadable ({e}); ignored"),
                 }
             }
         });
+    }
 
-        let mut wanted = Vec::new();
-        for &off in &self.data_offsets {
-            let pos = focus + off;
-            if let std::collections::hash_map::Entry::Vacant(slot) = self.entries.entry(pos) {
-                slot.insert(Entry { loaded: false, version: 0, requested: None, shown: None, has_mesh: false });
-                self.loading += 1;
-                wanted.push((dist_key(off), Job::Generate(pos)));
+    fn node_job(&mut self, key: NodeKey, version: u64, group: u32) -> Job {
+        let step = key.step();
+        let min = (key.pos * CHUNK_SIZE - APRON) * step;
+        self.ensure_regions(CellPos::tier_of(key.level), min, min + (CHUNK_SIZE + 2 * APRON) * step);
+        Job::Node { key, version, group, cells: self.log.gather_node(key) }
+    }
+
+    /// Decide which nodes the focus asks for, start what they need and drop
+    /// the rest. `moved` also re-prioritises what is queued.
+    fn retarget(&mut self, moved: bool, events: &mut Vec<MeshEvent>) {
+        self.tree_dirty = false;
+        let Some(focus) = self.focus else { return };
+        for n in self.nodes.values_mut() {
+            n.wanted = false;
+        }
+
+        // The coarsest nodes within view, over the whole height of the
+        // terrain and around the focus wherever it is.
+        let cell = self.params.cell_size as f64;
+        let size = (CHUNK_SIZE << MAX_LEVEL) as f64;
+        let view = self.config.view_distance as f64 / cell;
+        let (low, high) = self.generator.height_range();
+        let reach = (CHUNK_SIZE * 8) as f64;
+        let y0 = ((low as f64 / cell).min(focus.y - reach) / size).floor() as i32;
+        let y1 = ((high as f64 / cell).max(focus.y + reach) / size).floor() as i32;
+        let r = (view / size).ceil() as i32 + 1;
+        let c = (focus / size).floor().as_ivec3();
+        let mut jobs = Vec::new();
+        let mut roots = std::mem::take(&mut self.roots);
+        roots.clear();
+        for_box(IVec3::new(c.x - r, y0, c.z - r), IVec3::new(c.x + r, y1, c.z + r), |pos| {
+            let key = NodeKey::new(MAX_LEVEL, pos);
+            let level_with = DVec3::new(focus.x, key.origin().y as f64, focus.z);
+            if distance(key, level_with) <= view {
+                roots.push(key);
+                self.visit(key, focus, &mut jobs);
+            }
+        });
+        self.roots = roots;
+
+        // Say what is drawn now before taking anything away, so that the
+        // renderer never holds a frame with a node gone and nothing in its place.
+        self.redraw(events);
+
+        // Finer nodes under a node that is wanted whole stay until its own
+        // mesh is ready; everything else unwanted goes.
+        let gone: Vec<NodeKey> =
+            self.nodes.iter().filter(|(k, n)| !n.wanted && !self.kept(**k)).map(|(k, _)| *k).collect();
+        let mut released = Vec::new();
+        for key in gone {
+            let node = self.nodes.remove(&key).unwrap();
+            if let Some(parent) = (key.level < MAX_LEVEL).then(|| self.nodes.get_mut(&key.parent())).flatten() {
+                parent.children -= 1;
+            }
+            if node.has_mesh {
+                self.meshed -= 1;
+                events.push(MeshEvent::Remove { key, urgent: false });
+            }
+            if key.level == 0 {
+                released.extend(self.volume.chunks.remove(&key.pos));
             }
         }
-        self.pool.push_all(wanted);
-        // Chunks newly inside the mesh radius, or whose job was dropped.
-        for i in 0..self.mesh_offsets.len() {
-            let pos = focus + self.mesh_offsets[i];
-            if self.entries.get(&pos).is_some_and(|e| e.loaded && e.requested != Some(e.version)) {
-                self.queue_check(pos);
+        if !released.is_empty() {
+            self.pool.push(IDLE, Job::Release(released));
+        }
+
+        if moved {
+            // Re-prioritise what is still queued; drop jobs nobody wants any more.
+            let nodes = &self.nodes;
+            self.pool.rekey(|job| match job {
+                Job::Node { key, version, group: 0, .. } => {
+                    nodes.get(key).filter(|n| n.version == *version).map(|n| priority(*key, focus, n.refine))
+                }
+                Job::Node { .. } | Job::Mesh { .. } => Some(URGENT),
+                Job::Bake { .. } | Job::Release(_) => Some(IDLE),
+            });
+        }
+        self.pool.push_all(jobs);
+    }
+
+    fn visit(&mut self, key: NodeKey, focus: DVec3, jobs: &mut Vec<(u64, Job)>) {
+        if !self.nodes.contains_key(&key) {
+            self.next_version += 1;
+            self.nodes.insert(
+                key,
+                Node {
+                    version: self.next_version,
+                    requested: None,
+                    shown: None,
+                    has_mesh: false,
+                    wanted: false,
+                    refine: false,
+                    children: 0,
+                    children_cover: false,
+                    drawn: false,
+                    marked: false,
+                },
+            );
+            // Nodes are visited from the top down, so the parent is there.
+            if key.level < MAX_LEVEL {
+                self.nodes.get_mut(&key.parent()).unwrap().children += 1;
             }
         }
+        let node = self.nodes.get_mut(&key).unwrap();
+        node.wanted = true;
+        // A node already split stays split a little longer, so standing on a
+        // boundary does not flip it back and forth.
+        let limit = self.config.detail as f64 * key.size() as f64 * if node.refine { 1.1 } else { 1.0 };
+        node.refine = key.level > 0 && distance(key, focus) < limit;
+        let (refine, version) = (node.refine, node.version);
+        // A split node only needs a mesh to stand in until its children have theirs.
+        if node.requested != Some(version) && (!refine || node.shown.is_none()) {
+            node.requested = Some(version);
+            let job = self.node_job(key, version, 0);
+            jobs.push((priority(key, focus, refine), job));
+        }
+        if refine {
+            for child in key.children() {
+                self.visit(child, focus, jobs);
+            }
+        }
+    }
+
+    /// Is this unwanted node standing in for a wanted coarser one whose mesh
+    /// is not ready?
+    fn kept(&self, mut key: NodeKey) -> bool {
+        while key.level < MAX_LEVEL {
+            key = key.parent();
+            if let Some(n) = self.nodes.get(&key).filter(|n| n.wanted) {
+                return !n.refine && n.shown != Some(n.version);
+            }
+        }
+        false
     }
 
     fn collect(&mut self, events: &mut Vec<MeshEvent>) {
@@ -378,175 +516,232 @@ impl World {
 
     fn accept(&mut self, done: Done, events: &mut Vec<MeshEvent>) {
         match done {
-            Done::Generated(pos, chunk, saved) => {
-                let Some(e) = self.entries.get_mut(&pos) else { return };
-                if e.loaded {
-                    return;
-                }
-                e.loaded = true;
-                self.loading -= 1;
-                self.volume.insert(pos, chunk);
-                if let Some(saved) = saved {
-                    self.volume.touched.insert(pos, saved.touched);
-                    let origin = chunk_origin(pos);
-                    for i in saved.awake {
-                        let i = i as i32;
-                        let local = IVec3::new(i & CHUNK_MASK, i >> (2 * CHUNK_BITS), (i >> CHUNK_BITS) & CHUNK_MASK);
-                        self.sand.wake(origin + local);
-                    }
-                }
-                for n in neighbours() {
-                    self.queue_check(pos + n);
-                }
+            Done::Baked { cell, ops, baked } => {
+                // The cell resolves to the same samples as before, so nothing is remeshed.
+                self.log.rebase(cell, ops, Arc::new(baked));
+                self.baking.remove(&cell);
+                self.bakes += 1;
             }
-            Done::Meshed { pos, version, group, mesh } => {
+            Done::Node { key, version, group, mesh, chunk } => {
+                // A result for an older version is out of date: a newer job is on its way.
+                let current = self.nodes.get(&key).is_some_and(|n| n.version == version);
+                if let (true, Some(chunk)) = (current, chunk) {
+                    self.volume.insert(key.pos, chunk);
+                }
                 if group == 0 {
-                    self.show(pos, version, mesh, false, events);
+                    if current {
+                        self.show(key, version, mesh, false, events);
+                    }
                     return;
                 }
                 let Some(g) = self.groups.get_mut(&group) else { return };
-                g.meshes.push((pos, version, mesh));
+                if current {
+                    g.meshes.push((key, version, mesh));
+                }
                 g.remaining -= 1;
                 if g.remaining == 0 {
-                    for (pos, version, mesh) in self.groups.remove(&group).unwrap().meshes {
-                        self.show(pos, version, mesh, true, events);
+                    for (key, version, mesh) in self.groups.remove(&group).unwrap().meshes {
+                        self.show(key, version, mesh, true, events);
                     }
                 }
             }
         }
     }
 
-    fn show(&mut self, pos: ChunkPos, version: u32, mesh: ChunkMesh, urgent: bool, events: &mut Vec<MeshEvent>) {
-        let Some(e) = self.entries.get_mut(&pos) else { return };
-        // Never replace a newer mesh with an older one.
-        if e.shown.is_some_and(|s| s >= version) {
+    fn show(&mut self, key: NodeKey, version: u64, mesh: ChunkMesh, urgent: bool, events: &mut Vec<MeshEvent>) {
+        let Some(n) = self.nodes.get_mut(&key) else { return };
+        if n.version != version {
             return;
         }
-        e.shown = Some(version);
-        match (mesh.is_empty(), e.has_mesh) {
+        n.shown = Some(version);
+        match (mesh.is_empty(), n.has_mesh) {
             (true, true) => {
-                e.has_mesh = false;
+                n.has_mesh = false;
                 self.meshed -= 1;
-                events.push(MeshEvent::Remove { pos, urgent });
+                events.push(MeshEvent::Remove { key, urgent });
             }
             (true, false) => {}
             (false, had) => {
                 if !had {
-                    e.has_mesh = true;
+                    n.has_mesh = true;
                     self.meshed += 1;
                 }
-                events.push(MeshEvent::Upload { pos, mesh, urgent });
+                events.push(MeshEvent::Upload { key, mesh, urgent });
             }
         }
+        self.drawn_dirty = true;
+        // Finer nodes that stood in for this one can go now.
+        if !n.refine && n.children > 0 {
+            self.tree_dirty = true;
+        }
     }
 
-    /// Start a mesh job for `pos` if it is in range, ready and out of date.
-    fn start_mesh(&mut self, pos: ChunkPos, group: u32, events: &mut Vec<MeshEvent>) -> bool {
-        let Some(center) = self.center else { return false };
-        if !self.mesh_set.contains(&(pos - center)) {
-            return false;
-        }
-        let Some(e) = self.entries.get(&pos) else { return false };
-        if !e.loaded || e.requested == Some(e.version) {
-            return false;
-        }
-        let version = e.version;
-        let mut chunks = Vec::with_capacity(27);
-        for n in neighbours() {
-            let Some(c) = self.volume.chunks.get(&(pos + n)) else { return false };
-            chunks.push(c.clone());
-        }
-        self.entries.get_mut(&pos).unwrap().requested = Some(version);
-        // Open sky and solid rock, the common cases, need no job at all.
-        let side = |c: &Chunk| match c {
-            Chunk::Uniform(s) => Some(s.solid()),
-            Chunk::Dense(_) => None,
-        };
-        if let Some(first) = side(&chunks[0]) {
-            if chunks.iter().all(|c| side(c) == Some(first)) {
-                self.show(pos, version, ChunkMesh::default(), group != 0, events);
-                return false;
+    /// Can this node's volume be drawn without a hole, by itself or by finer
+    /// nodes? Records the answer for the finer nodes alone in `children_cover`.
+    fn cover(&mut self, key: NodeKey) -> bool {
+        let Some(n) = self.nodes.get(&key) else { return false };
+        let (shown, children) = (n.shown.is_some(), n.children);
+        let mut all = children == 8;
+        if children > 0 {
+            for child in key.children() {
+                all &= self.cover(child);
             }
         }
-        let chunks: Box<[Arc<Chunk>; 27]> = chunks.into_boxed_slice().try_into().ok().expect("27 neighbours");
-        let key = if group != 0 { URGENT } else { dist_key(pos - center) };
-        self.pool.push(key, Job::Mesh { pos, version, group, chunks });
-        true
+        self.nodes.get_mut(&key).unwrap().children_cover = all;
+        shown || all
     }
 
-    fn start_meshes(&mut self, events: &mut Vec<MeshEvent>) {
-        // Bound the work of one update, whether or not a check starts a job.
-        for _ in 0..self.config.mesh_starts_per_update {
-            let Some(pos) = self.check.pop_front() else { break };
-            self.queued_check.remove(&pos);
-            self.start_mesh(pos, 0, events);
+    /// Choose what to draw for a node's volume: itself or its children,
+    /// never both and never part of each. Needs `cover` to have run.
+    fn draw(&self, key: NodeKey, out: &mut Vec<NodeKey>) {
+        let Some(n) = self.nodes.get(&key) else { return };
+        let whole = !n.refine && if n.wanted { n.shown == Some(n.version) } else { n.shown.is_some() };
+        if whole {
+            out.push(key);
+        } else if n.children_cover {
+            // Wanted finer, or wanted whole but its mesh is not ready (or is
+            // out of date) while finer ones are still here.
+            key.children().for_each(|c| self.draw(c, out));
+        } else if n.shown.is_some() {
+            out.push(key);
+        } else if n.children > 0 {
+            // Nothing complete yet: show what there is.
+            key.children().for_each(|c| self.draw(c, out));
         }
     }
 
-    /// Record that samples of `chunks` changed and remesh everything whose
-    /// block includes them, as one group that swaps in together.
-    pub fn chunks_edited(&mut self, chunks: &[ChunkPos], events: &mut Vec<MeshEvent>) {
-        let mut affected: IntSet<ChunkPos> = IntSet::default();
-        for &c in chunks {
-            self.unsaved.insert(c);
-            affected.extend(neighbours().map(|n| c + n));
+    /// Work out what should be on screen and tell the renderer what changed.
+    fn redraw(&mut self, events: &mut Vec<MeshEvent>) {
+        self.drawn_dirty = false;
+        let roots = std::mem::take(&mut self.roots);
+        let mut draw = Vec::new();
+        for &root in &roots {
+            self.cover(root);
+            self.draw(root, &mut draw);
         }
+        self.roots = roots;
+        for key in &draw {
+            self.nodes.get_mut(key).unwrap().marked = true;
+        }
+        let (mut show, mut hide) = (Vec::new(), Vec::new());
+        self.drawn_levels = [0; LEVELS];
+        for (key, n) in &mut self.nodes {
+            match (n.drawn, n.marked) {
+                (false, true) => show.push(*key),
+                (true, false) => hide.push(*key),
+                _ => {}
+            }
+            n.drawn = std::mem::take(&mut n.marked);
+            self.drawn_levels[key.level as usize] += n.drawn as u32;
+        }
+        if !show.is_empty() || !hide.is_empty() {
+            events.push(MeshEvent::Visible { show, hide });
+        }
+    }
+
+    /// Apply an edit: change the loaded samples, log it, and start the
+    /// remeshing, whose results arrive through [`update`](Self::update).
+    pub fn edit(&mut self, op: &Op) -> EditOutcome {
+        let (lo, hi) = op.bounds_all(&self.rules);
+        for tier in 0..TIERS as u8 {
+            self.ensure_regions(tier, lo, hi);
+        }
+        let outcome = edit::edit_volume(&mut self.volume, &self.rules, op);
+        // An op that changes nothing is not worth keeping.
+        if outcome.chunks.is_empty() && outcome.covered {
+            return outcome;
+        }
+        self.log.push(&self.rules, op);
+        if let Some(fragments) = &outcome.fragments {
+            self.log.push(&self.rules, fragments);
+        }
+
+        let focus = self.focus.unwrap_or(DVec3::ZERO);
         let group = self.next_group;
         self.next_group = self.next_group.wrapping_add(1).max(1);
-        let mut started = 0;
-        for pos in affected {
-            if let Some(e) = self.entries.get_mut(&pos) {
-                e.version += 1;
-            }
-            if self.start_mesh(pos, group, events) {
-                started += 1;
-            }
-        }
-        if started > 0 {
-            self.groups.insert(group, Group { remaining: started, meshes: Vec::with_capacity(started) });
-        }
-    }
+        let mut jobs = Vec::new();
 
-    /// Apply an edit and remesh what it changed.
-    pub fn edit(&mut self, op: &EditOp, events: &mut Vec<MeshEvent>) -> EditOutcome {
-        let outcome = edit::apply(&mut self.volume, &self.rules, op);
-        if !outcome.chunks.is_empty() {
-            self.chunks_edited(&outcome.chunks, events);
-            // Loose material in and just around the edit may now be unsupported.
-            self.sand.wake_region(&self.volume, outcome.min - 1, outcome.max + 1);
+        // The finest level: what changed is already in `volume`, so remesh
+        // from it, all at once.
+        let mut affected = Vec::new();
+        for_box(chunk_of(outcome.min - APRON), chunk_of(outcome.max + APRON), |pos| affected.push(pos));
+        for pos in affected {
+            let key = NodeKey::new(0, pos);
+            if !self.nodes.contains_key(&key) {
+                continue;
+            }
+            let loaded = self.volume.chunks.contains_key(&pos);
+            let block = (pos * CHUNK_SIZE - APRON, pos * CHUNK_SIZE + CHUNK_SIZE + APRON - 1);
+            let touched = outcome.changed.is_some_and(|(a, b)| a.cmple(block.1).all() && b.cmpge(block.0).all());
+            // A chunk still being generated was generated without this op.
+            if loaded && !touched {
+                continue;
+            }
+            let version = self.bump(key);
+            let chunks: Option<Vec<Arc<Chunk>>> =
+                neighbours().map(|n| self.volume.chunks.get(&(pos + n)).cloned()).collect();
+            let job = match chunks {
+                Some(chunks) => {
+                    let chunks = chunks.into_boxed_slice().try_into().ok().expect("27 neighbours");
+                    Job::Mesh { key, version, group, chunks }
+                }
+                None => self.node_job(key, version, group),
+            };
+            jobs.push((URGENT, job));
+        }
+        if !jobs.is_empty() {
+            self.groups.insert(group, Group { remaining: jobs.len(), meshes: Vec::with_capacity(jobs.len()) });
+        }
+
+        // Coarser levels resolve the log again. Only nodes on screen as
+        // themselves need it now; the rest wait until they are.
+        for level in 1..=MAX_LEVEL {
+            let (min, max) = op.bounds(&self.rules, level);
+            let mut affected = Vec::new();
+            for_box(chunk_of(min - APRON), chunk_of(max + APRON), |pos| affected.push(NodeKey::new(level, pos)));
+            for key in affected {
+                let Some(n) = self.nodes.get(&key) else { continue };
+                let (wanted, refine) = (n.wanted, n.refine);
+                let version = self.bump(key);
+                if wanted && !refine {
+                    self.nodes.get_mut(&key).unwrap().requested = Some(version);
+                    let job = self.node_job(key, version, 0);
+                    jobs.push((priority(key, focus, false), job));
+                }
+            }
+        }
+        self.pool.push_all(jobs);
+
+        // Bake cells that have collected enough ops.
+        for cell in EditLog::cells_of(&self.rules, op) {
+            let Some(edits) = self.log.cell(cell) else { continue };
+            if edits.ops.len() >= self.config.bake_ops && self.baking.insert(cell) {
+                self.pool.push(IDLE - 1, Job::Bake { cell, edits: edits.clone() });
+            }
         }
         outcome
     }
 
-    /// Hand a chunk's edits to the store if they have changed since last time.
-    /// `unloading` also takes its settling sand with it.
-    fn persist(&mut self, pos: ChunkPos, unloading: bool) {
-        let awake = if unloading { self.sand.take_chunk(pos) } else { self.sand.awake_in(pos) };
-        let changed = self.unsaved.remove(&pos);
-        let (Some(store), Some(chunk)) = (&self.store, self.volume.chunks.get(&pos)) else { return };
-        // Sand still settling must resume after a reload even if no sample changed yet.
-        if !changed && !(unloading && !awake.is_empty()) {
-            return;
+    /// Give a node a new version and return it.
+    fn bump(&mut self, key: NodeKey) -> u64 {
+        self.next_version += 1;
+        let n = self.nodes.get_mut(&key).unwrap();
+        n.version = self.next_version;
+        if key.level == 0 {
+            n.requested = Some(n.version);
         }
-        let awake: Vec<u16> = awake.iter().map(|&p| index(local_of(p)) as u16).collect();
-        let empty;
-        let touched = match self.volume.touched.get(&pos) {
-            Some(t) => t,
-            None => {
-                empty = Box::new([0u64; tungsten_core::CHUNK_VOLUME / 64]);
-                &empty
-            }
-        };
-        store.put(pos, codec::encode(chunk, touched, &awake));
+        self.drawn_dirty = true;
+        n.version
     }
 
     /// Hand every unsaved edit to the store and write it to disk; in the
     /// background if `wait` is false.
     pub fn save(&mut self, wait: bool) -> std::io::Result<()> {
         let Some(store) = self.store.clone() else { return Ok(()) };
-        let pending: Vec<ChunkPos> = self.unsaved.iter().copied().collect();
-        for pos in pending {
-            self.persist(pos, false);
+        for pos in self.log.take_dirty() {
+            if let Some(cell) = self.log.cell(pos) {
+                store.put(pos, cell.encode());
+            }
         }
         if wait {
             store.flush().map(|_| ())
@@ -559,32 +754,20 @@ impl World {
             Ok(())
         }
     }
-
-    /// One step of the sand simulation.
-    pub fn step_sand(&mut self, events: &mut Vec<MeshEvent>) {
-        let mut changed = Vec::new();
-        self.sand.step(&mut self.volume, &mut changed);
-        if !changed.is_empty() {
-            self.chunks_edited(&changed, events);
-        }
-    }
-
-    /// Samples of loose material currently settling.
-    pub fn sand_awake(&self) -> usize {
-        self.sand.awake()
-    }
-
-    pub fn volume_mut(&mut self) -> &mut Volume {
-        &mut self.volume
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+    use tungsten_core::Material;
+    use tungsten_core::edit::FP;
 
-    fn settle(world: &mut World, focus: ChunkPos, events: &mut Vec<MeshEvent>) {
+    fn config() -> StreamConfig {
+        StreamConfig { view_distance: 300.0, detail: 1.0, workers: 4, bake_ops: usize::MAX }
+    }
+
+    fn settle(world: &mut World, focus: DVec3, events: &mut Vec<MeshEvent>) {
         let start = Instant::now();
         loop {
             world.update(focus, events);
@@ -594,109 +777,256 @@ mod tests {
                     return;
                 }
             }
-            assert!(start.elapsed() < Duration::from_secs(60), "streaming did not settle");
+            assert!(start.elapsed() < Duration::from_secs(120), "streaming did not settle");
             std::thread::sleep(Duration::from_millis(1));
         }
     }
 
-    #[test]
-    fn loads_meshes_and_unloads() {
-        let config = StreamConfig { radius_h: 3, radius_v: 2, workers: 4, mesh_starts_per_update: 16 };
-        let mut world = World::new(WorldParams::default(), config, None);
-        let mut events = Vec::new();
-        settle(&mut world, IVec3::ZERO, &mut events);
-        let s = world.stats();
-        assert_eq!(s.loading, 0);
-        assert_eq!(s.loaded, world.data_offsets.len());
-        let uploads = events.iter().filter(|e| matches!(e, MeshEvent::Upload { .. })).count();
-        assert!(uploads > 10 && uploads == s.meshed, "{uploads} uploads, {} meshed", s.meshed);
-        // Every mesh in range is current.
-        for off in &world.mesh_offsets {
-            let e = &world.entries[off];
-            assert_eq!(e.shown, Some(e.version), "chunk {off} not meshed");
-        }
+    /// A point on the ground near the origin, metres.
+    fn ground(world: &World) -> DVec3 {
+        DVec3::new(4.0, world.generator().surface_height(4.0, 4.0) as f64, 4.0)
+    }
 
-        // Move far away: everything old unloads, and removals match uploads.
-        events.clear();
-        let far = IVec3::new(40, 0, 0);
-        settle(&mut world, far, &mut events);
-        let removed = events.iter().filter(|e| matches!(e, MeshEvent::Remove { .. })).count();
-        assert_eq!(removed, uploads);
-        assert!(world.volume.chunks.keys().all(|&p| world.keep_set.contains(&(p - far))));
-        assert_eq!(world.stats().loaded, world.data_offsets.len());
+    /// What the renderer would hold after these events: meshes and what is on screen.
+    #[derive(Default)]
+    struct Screen {
+        meshes: IntSet<NodeKey>,
+        visible: IntSet<NodeKey>,
+    }
+
+    impl Screen {
+        fn apply(&mut self, events: &mut Vec<MeshEvent>) {
+            for e in events.drain(..) {
+                match e {
+                    MeshEvent::Upload { key, .. } => {
+                        self.meshes.insert(key);
+                    }
+                    MeshEvent::Remove { key, .. } => {
+                        self.meshes.remove(&key);
+                    }
+                    MeshEvent::Visible { show, hide } => {
+                        hide.iter().for_each(|k| assert!(self.visible.remove(k), "{k:?} hidden twice"));
+                        show.iter().for_each(|k| assert!(self.visible.insert(*k), "{k:?} shown twice"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every wanted root's volume is drawn exactly once: by itself, or by all
+    /// eight children each drawn exactly once.
+    fn drawn_once(screen: &Screen, key: NodeKey) -> bool {
+        if screen.visible.contains(&key) {
+            fn none_below(screen: &Screen, key: NodeKey) -> bool {
+                key.level == 0 || key.children().all(|c| !screen.visible.contains(&c) && none_below(screen, c))
+            }
+            return none_below(screen, key);
+        }
+        key.level > 0 && key.children().all(|c| drawn_once(screen, c))
+    }
+
+    fn roots(world: &World) -> Vec<NodeKey> {
+        assert!(!world.roots.is_empty() && world.roots.iter().all(|r| world.nodes[r].wanted));
+        world.roots.clone()
+    }
+
+    /// Does anything exist that could draw all of this node's volume?
+    fn covered(world: &World, key: NodeKey) -> bool {
+        world
+            .nodes
+            .get(&key)
+            .is_some_and(|n| n.shown.is_some() || (key.level > 0 && key.children().all(|c| covered(world, c))))
     }
 
     #[test]
-    fn edits_and_settling_sand_survive_unload_and_restart() {
-        use tungsten_core::edit::{EditKind, EditOp, FP};
+    fn builds_a_tree_around_the_focus_and_follows_it() {
+        let mut world = World::new(WorldParams::default(), config(), None);
+        let (mut events, mut screen) = (Vec::new(), Screen::default());
+        let here = ground(&world);
+        settle(&mut world, here, &mut events);
+        screen.apply(&mut events);
+
+        let s = world.stats();
+        assert!(roots(&world).len() >= 8, "{} roots", roots(&world).len());
+        assert!(roots(&world).iter().all(|&r| drawn_once(&screen, r)), "holes or overlaps");
+        // Fine detail is near the focus and every level is in use.
+        assert!(s.drawn.iter().all(|&n| n > 0), "{:?}", s.drawn);
+        let chunk = (here / world.params().chunk_metres() as f64).floor().as_ivec3();
+        assert!(world.neighbourhood_loaded(chunk));
+        assert!(screen.visible.contains(&NodeKey::new(0, chunk)));
+        assert_eq!(screen.meshes.len(), s.meshed);
+        assert!(screen.meshes.iter().any(|k| k.level == 0) && screen.meshes.iter().any(|k| k.level == MAX_LEVEL));
+        // Every leaf is up to date.
+        for (key, n) in &world.nodes {
+            assert!(n.wanted, "{key:?} kept for nothing");
+            assert!(n.refine || n.shown == Some(n.version), "{key:?} not meshed");
+        }
+        assert_eq!(s.chunks, world.nodes.keys().filter(|k| k.level == 0).count());
+
+        // Walk in steps: never a hole or an overlap on the way.
+        let mut at = here;
+        for _ in 0..12 {
+            at += DVec3::new(7.0, 0.0, 3.0);
+            for _ in 0..4 {
+                world.update(at, &mut events);
+                screen.apply(&mut events);
+                let complete = roots(&world).iter().filter(|&&r| covered(&world, r)).all(|&r| drawn_once(&screen, r));
+                assert!(complete, "hole or overlap while moving");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        // Far away: nothing of the old place is left.
+        let far = here + DVec3::new(5000.0, 0.0, -3000.0);
+        settle(&mut world, far, &mut events);
+        screen.apply(&mut events);
+        let near = |k: &NodeKey| distance(*k, far / world.params().cell_size as f64) < 400.0 / 0.25 * 1.5;
+        assert!(world.nodes.keys().all(near) && screen.meshes.iter().all(near) && screen.visible.iter().all(near));
+        assert_eq!(screen.meshes.len(), world.stats().meshed);
+        assert!(roots(&world).iter().all(|&r| drawn_once(&screen, r)));
+        assert_eq!(world.volume.chunks.len(), world.nodes.keys().filter(|k| k.level == 0).count());
+    }
+
+    fn dig_and_build(world: &mut World) -> Vec<ChunkPos> {
+        let here = ground(world) / world.params().cell_size as f64;
+        let at = |dx: f64, dy: f64| {
+            [((here.x + dx) * FP as f64) as i64, ((here.y + dy) * FP as f64) as i64, (here.z * FP as f64) as i64]
+        };
+        let mut chunks = Vec::new();
+        for k in 0..30 {
+            let k = k as f64;
+            let ops = [
+                Op::Break { center: at(k * 1.5 - 20.0, 2.0 - k * 0.4), radius: 5 * FP, nearest: true },
+                Op::Place { center: at(k * 1.5 - 20.0, 9.0), radius: 3 * FP, material: Material::SAND, exclude: None },
+            ];
+            for op in &ops {
+                chunks.extend(world.edit(op).chunks);
+            }
+        }
+        chunks.sort_unstable_by_key(|c| (c.x, c.y, c.z));
+        chunks.dedup();
+        assert!(chunks.len() >= 4, "the session should span chunks, touched {}", chunks.len());
+        chunks
+    }
+
+    #[test]
+    fn edits_survive_unload_and_restart() {
         let dir = std::env::temp_dir().join(format!("tungsten-test-world-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let config = StreamConfig { radius_h: 2, radius_v: 2, workers: 4, mesh_starts_per_update: 64 };
         let params = WorldParams::default();
         let open = || {
             let (store, params) = Store::open(&dir, params).unwrap();
-            World::new(params, config, Some(Arc::new(store)))
+            World::new(params, config(), Some(Arc::new(store)))
         };
-        let hash = |w: &World, pos: ChunkPos| w.volume.chunks[&pos].content_hash(0);
+        let hashes = |w: &World, chunks: &[ChunkPos]| -> Vec<u64> {
+            chunks.iter().map(|c| w.volume.chunks[c].content_hash(0)).collect()
+        };
         let mut events = Vec::new();
 
         let mut world = open();
-        settle(&mut world, IVec3::ZERO, &mut events);
-        let untouched = hash(&world, IVec3::ZERO);
-        // Dig, then drop a ball of sand that is still settling when we leave.
-        let ground = world.generator().surface_height(4.0, 4.0) as f64 / params.cell_size as f64;
-        let at = |dy: f64| [8 * FP, ((ground + dy) * FP as f64) as i64, 8 * FP];
-        for tick in 0..40 {
-            let op =
-                EditOp { kind: EditKind::Break, center: at(0.0), radius: 4 * FP, material: 0, tick, exclude: None };
-            world.edit(&op, &mut events);
-        }
-        let op =
-            EditOp { kind: EditKind::Place, center: at(8.0), radius: 3 * FP, material: 3, tick: 40, exclude: None };
-        let outcome = world.edit(&op, &mut events);
-        world.step_sand(&mut events);
-        assert!(world.sand_awake() > 0);
-        let edited: Vec<ChunkPos> = outcome.chunks.clone();
-        let before: Vec<u64> = edited.iter().map(|&c| hash(&world, c)).collect();
-        let awake_before = world.sand_awake();
+        let here = ground(&world);
+        settle(&mut world, here, &mut events);
+        let edited = dig_and_build(&mut world);
+        let untouched = World::new(params, config(), None);
+        settle(&mut world, here, &mut events);
+        let before = hashes(&world, &edited);
+        assert!(world.stats().ops > 0 && world.groups.is_empty());
 
-        // Walk away (chunks unload), come back (they reload from the store).
-        settle(&mut world, IVec3::new(30, 0, 0), &mut events);
-        assert_eq!(world.sand_awake(), 0);
-        assert!(world.volume.touched.is_empty());
-        settle(&mut world, IVec3::ZERO, &mut events);
-        let after: Vec<u64> = edited.iter().map(|&c| hash(&world, c)).collect();
-        assert_eq!(before, after, "edits changed across unload");
-        assert_eq!(world.sand_awake(), awake_before, "settling sand was forgotten");
+        // The chunks in memory are what the log resolves to from scratch.
+        for &pos in &edited {
+            let key = NodeKey::new(0, pos);
+            let mut block = LocalField::block(key);
+            untouched.generator().fill_block(key, &mut block);
+            let plain = block.interior();
+            log::resolve(&mut block, &world.rules, &world.log.gather_node(key));
+            assert!(block.interior() == *world.volume.chunks[&pos], "chunk {pos} differs from its log");
+            assert!(plain != *world.volume.chunks[&pos], "chunk {pos} reported as changed but was not");
+        }
+
+        // Walk away (chunks unload), come back (they are resolved again).
+        settle(&mut world, here + DVec3::X * 3000.0, &mut events);
+        assert!(edited.iter().all(|c| !world.volume.chunks.contains_key(c)));
+        settle(&mut world, here, &mut events);
+        assert_eq!(before, hashes(&world, &edited), "edits changed across unload");
 
         // Quit and restart: same again from disk.
         world.save(true).unwrap();
         drop(world);
         let mut world = open();
-        settle(&mut world, IVec3::ZERO, &mut events);
-        let restarted: Vec<u64> = edited.iter().map(|&c| hash(&world, c)).collect();
-        assert_eq!(before, restarted, "edits changed across restart");
-        assert_eq!(world.sand_awake(), awake_before);
-        assert!(edited.iter().any(|&c| c == IVec3::ZERO || hash(&world, c) != untouched));
+        assert_eq!(world.stats().ops, 0);
+        settle(&mut world, here, &mut events);
+        assert_eq!(before, hashes(&world, &edited), "edits changed across restart");
+        assert!(world.stats().ops > 0);
         drop(world);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn edits_remesh_as_a_group() {
-        let config = StreamConfig { radius_h: 2, radius_v: 2, workers: 4, mesh_starts_per_update: 64 };
-        let mut world = World::new(WorldParams::default(), config, None);
-        let mut events = Vec::new();
-        settle(&mut world, IVec3::ZERO, &mut events);
-        events.clear();
+    fn edits_reach_the_screen_together_and_at_every_level() {
+        let mut world = World::new(WorldParams::default(), config(), None);
+        let (mut events, mut screen) = (Vec::new(), Screen::default());
+        let here = ground(&world);
+        settle(&mut world, here, &mut events);
+        screen.apply(&mut events);
 
-        // Fill the corner sample shared by eight chunks' aprons.
-        let p = IVec3::ZERO;
-        world.volume_mut().set(p, tungsten_core::Sample { fill: 255, mat: 1 });
-        world.volume_mut().set(p + IVec3::Y * 40, tungsten_core::Sample { fill: 255, mat: 1 });
-        world.chunks_edited(&[IVec3::ZERO, IVec3::new(0, 1, 0)], &mut events);
-        settle(&mut world, IVec3::ZERO, &mut events);
-        assert!(events.iter().any(|e| matches!(e, MeshEvent::Upload { pos, .. } if *pos == IVec3::new(0, 1, 0))));
+        let cells = here / world.params().cell_size as f64;
+        let center = [(cells.x * FP as f64) as i64, (cells.y * FP as f64) as i64, (cells.z * FP as f64) as i64];
+        let outcome = world.edit(&Op::Break { center, radius: 6 * FP, nearest: true });
+        assert!(!outcome.chunks.is_empty());
+        // The samples change at once; the meshes follow as one urgent batch.
+        assert!(!world.volume.get(cells.floor().as_ivec3()).unwrap().solid());
+        settle(&mut world, here, &mut events);
+        let urgent: Vec<NodeKey> = events
+            .iter()
+            .filter_map(|e| match e {
+                MeshEvent::Upload { key, urgent: true, .. } => Some(*key),
+                _ => None,
+            })
+            .collect();
+        assert!(!urgent.is_empty() && urgent.iter().all(|k| k.level == 0), "{urgent:?}");
         assert!(world.groups.is_empty());
+        screen.apply(&mut events);
+        assert!(roots(&world).iter().all(|&r| drawn_once(&screen, r)));
+
+        // From far enough away the same hole is drawn by a coarser level.
+        let away = here + DVec3::new(60.0, 0.0, 0.0);
+        settle(&mut world, away, &mut events);
+        screen.apply(&mut events);
+        let hole = cells.floor().as_ivec3();
+        let shows_hole = screen.visible.iter().find(|k| {
+            let rel = hole - k.origin();
+            rel.min_element() >= 0 && rel.max_element() < k.size()
+        });
+        let key = *shows_hole.expect("nothing drawn where the hole is");
+        assert!(key.level > 0, "still drawn at the finest level from 60 m");
+        let mut block = LocalField::block(key);
+        world.generator().fill_block(key, &mut block);
+        let generated = block.fill.clone();
+        log::resolve(&mut block, &world.rules, &world.log.gather_node(key));
+        assert!(block.fill != generated, "the coarse node does not see the edit");
+        let n = &world.nodes[&key];
+        assert_eq!(n.shown, Some(n.version));
+    }
+
+    #[test]
+    fn baking_changes_nothing_but_the_log() {
+        let run = |bake_ops: usize| {
+            let mut world = World::new(WorldParams::default(), StreamConfig { bake_ops, ..config() }, None);
+            let mut events = Vec::new();
+            let here = ground(&world);
+            settle(&mut world, here, &mut events);
+            let edited = dig_and_build(&mut world);
+            settle(&mut world, here, &mut events);
+            // Leave and return so every chunk is resolved from the log as it now is.
+            settle(&mut world, here + DVec3::X * 3000.0, &mut events);
+            settle(&mut world, here, &mut events);
+            let hashes: Vec<u64> = edited.iter().map(|c| world.volume.chunks[c].content_hash(0)).collect();
+            (hashes, world.stats())
+        };
+        let (plain, plain_stats) = run(usize::MAX);
+        let (baked, baked_stats) = run(8);
+        assert_eq!(plain, baked);
+        assert_eq!(plain_stats.bakes, 0);
+        assert!(baked_stats.bakes > 0 && baked_stats.ops < plain_stats.ops, "{baked_stats:?} against {plain_stats:?}");
     }
 }

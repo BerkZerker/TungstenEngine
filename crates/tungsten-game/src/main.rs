@@ -43,10 +43,12 @@ tungsten [options]
   --world NAME        world to load or create under ./worlds (default: default)
   --no-save           do not load or save a world
   --seed N            seed for a new world (default: built in)
-  --cell METRES       lattice spacing for a new world (default 0.5)
+  --cell METRES       finest lattice spacing for a new world (default 0.25)
   --fragment METRES   for a new world: breaking removes isolated pieces smaller than a
                       cube this size (default 1, 0 keeps everything)
-  --radius H[,V]      view radius in chunks, horizontal and vertical (default 12,6)
+  --view METRES       how far terrain is drawn (default 2048)
+  --detail N          how far out fine detail reaches; a node is drawn finer while
+                      the player is within N of its own lengths (default 2)
   --workers N         worker threads (default: cores - 2)
   --pos X,Y,Z         start position in metres
   --look YAW,PITCH    start view direction in degrees
@@ -118,13 +120,16 @@ fn parse_args() -> Result<Args, String> {
                     return Err("--fragment must be between 0 and 4 metres".into());
                 }
             }
-            "--radius" => {
-                let v = value()?;
-                let parts: Vec<i32> = v.split(',').filter_map(|p| p.parse().ok()).collect();
-                match parts[..] {
-                    [h] => (a.stream.radius_h, a.stream.radius_v) = (h, (h / 2).max(2)),
-                    [h, v] => (a.stream.radius_h, a.stream.radius_v) = (h, v),
-                    _ => return Err(format!("--radius: expected H or H,V, got '{v}'")),
+            "--view" => {
+                a.stream.view_distance = value()?.parse().map_err(|e| format!("--view: {e}"))?;
+                if !(32.0..=16384.0).contains(&a.stream.view_distance) {
+                    return Err("--view must be between 32 and 16384 metres".into());
+                }
+            }
+            "--detail" => {
+                a.stream.detail = value()?.parse().map_err(|e| format!("--detail: {e}"))?;
+                if !(1.0..=8.0).contains(&a.stream.detail) {
+                    return Err("--detail must be between 1 and 8".into());
                 }
             }
             "--workers" => a.stream.workers = value()?.parse().map_err(|e| format!("--workers: {e}"))?,

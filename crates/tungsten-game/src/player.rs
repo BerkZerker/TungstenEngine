@@ -463,6 +463,11 @@ mod tests {
     use tungsten_core::{Chunk, Sample};
 
     /// Flat dirt with its surface at y = -0.25 m (cells below y=0 are full).
+    /// These worlds are laid out sample by sample for half-metre cells.
+    fn coarse_params() -> WorldParams {
+        WorldParams { cell_size: 0.5, ..WorldParams::default() }
+    }
+
     fn flat_world() -> (Volume, WorldParams) {
         let mut vol = Volume::new();
         for y in -2..2 {
@@ -473,12 +478,12 @@ mod tests {
                 }
             }
         }
-        (vol, WorldParams::default())
+        (vol, coarse_params())
     }
 
     /// Ground rising `grade` metres per metre towards +Z, level across X.
     fn slope_world(grade: f32) -> (Volume, WorldParams) {
-        let params = WorldParams::default();
+        let params = coarse_params();
         let mut vol = Volume::new();
         for cy in -2..2 {
             for cz in -2..2 {

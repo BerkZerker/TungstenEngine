@@ -31,8 +31,9 @@ pub fn apply_events(game: &mut Game, gpu: &Gpu, renderer: &mut Renderer, budget:
             break;
         }
         match event {
-            MeshEvent::Upload { pos, mesh, .. } => renderer.upload_chunk(gpu, *pos, mesh),
-            MeshEvent::Remove { pos, .. } => renderer.remove_chunk(*pos),
+            MeshEvent::Upload { key, mesh, .. } => renderer.upload_node(gpu, *key, mesh),
+            MeshEvent::Remove { key, .. } => renderer.remove_node(*key),
+            MeshEvent::Visible { show, hide } => renderer.set_visible(show, hide),
         }
         done += 1;
     }
@@ -135,13 +136,13 @@ pub fn run(args: Args) -> Result<(), String> {
     write_bmp(&path, width, height, row_bytes as usize, &data).map_err(|e| format!("{}: {e}", path.display()))?;
     let s = game.world.stats();
     println!(
-        "{}: {}x{}  loaded {} chunks ({} dense, {} meshed) in {:.2} s  {} draws  {} tris  frame {:.2} ms  {}",
+        "{}: {}x{}  loaded {} nodes ({} meshed, {} near chunks) in {:.2} s  {} draws  {} tris  frame {:.2} ms  {}",
         path.display(),
         width,
         height,
-        s.loaded,
-        s.dense,
+        s.nodes,
         s.meshed,
+        s.chunks,
         load_time.as_secs_f32(),
         stats.draws,
         stats.triangles,

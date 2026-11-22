@@ -1,7 +1,7 @@
-//! On-disk storage of a world: a header, and region files of chunk deltas.
+//! On-disk storage of a world: a header, and region files of edit cells.
 //!
-//! A region file holds the saved chunks of a 16x16x16 block of chunks and is
-//! always replaced whole by writing a temporary file and renaming it, so a
+//! A region file holds the saved edit cells of a 16x16x16 block of them and
+//! is always replaced whole by writing a temporary file and renaming it, so a
 //! crash can never leave one half written.
 
 use std::collections::HashMap;
@@ -13,13 +13,15 @@ use std::sync::{Arc, Mutex};
 
 use glam::IVec3;
 use tungsten_core::hash::{IntMap, fnv1a};
+use tungsten_core::log::CellPos;
 use tungsten_core::worldgen::GENERATOR_VERSION;
-use tungsten_core::{CHUNK_SIZE, ChunkPos, WorldParams};
+use tungsten_core::{CHUNK_SIZE, WorldParams};
 
-const REGION_BITS: i32 = 4;
+/// Edit cells along the edge of a region.
+pub const REGION_BITS: i32 = 4;
 const REGION_MAGIC: &[u8; 4] = b"TNGR";
-const REGION_VERSION: u32 = 1;
-const WORLD_FORMAT: u32 = 1;
+const REGION_VERSION: u32 = 2;
+const WORLD_FORMAT: u32 = 2;
 
 #[derive(Default)]
 struct Region {
@@ -27,16 +29,20 @@ struct Region {
     dirty: bool,
 }
 
+/// A region: a tier of edit cells and a position in units of `1 << REGION_BITS` of them.
+pub type RegionPos = (u8, IVec3);
+
 pub struct Store {
     root: PathBuf,
-    regions: Mutex<IntMap<IVec3, Region>>,
+    regions: Mutex<IntMap<RegionPos, Region>>,
     temp_counter: AtomicU64,
 }
 
-fn region_of(pos: ChunkPos) -> (IVec3, u16) {
-    let r = IVec3::new(pos.x >> REGION_BITS, pos.y >> REGION_BITS, pos.z >> REGION_BITS);
-    let l = pos - (r << REGION_BITS);
-    (r, ((l.y << (2 * REGION_BITS)) | (l.z << REGION_BITS) | l.x) as u16)
+/// The region an edit cell is saved in, and its index there.
+pub fn region_of(cell: CellPos) -> (RegionPos, u16) {
+    let r = cell.pos >> REGION_BITS;
+    let l = cell.pos - (r << REGION_BITS);
+    ((cell.tier, r), ((l.y << (2 * REGION_BITS)) | (l.z << REGION_BITS) | l.x) as u16)
 }
 
 /// Replace `path` with `bytes` atomically.
@@ -112,7 +118,14 @@ impl Store {
                     get(k)?.parse().map_err(|_| format!("{}: bad '{k}'", header.display()))
                 };
                 if num("format")? != WORLD_FORMAT as u64 {
-                    return Err(format!("{}: unsupported world format {}", header.display(), num("format")?));
+                    return Err(format!(
+                        "{}: world format {} is not the format {} this build reads. \
+                         Start a new world with --world NAME, or move or delete {}",
+                        header.display(),
+                        num("format")?,
+                        WORLD_FORMAT,
+                        root.display()
+                    ));
                 }
                 if num("generator")? != GENERATOR_VERSION as u64 {
                     return Err(format!(
@@ -163,11 +176,11 @@ impl Store {
         &self.root
     }
 
-    fn region_path(&self, r: IVec3) -> PathBuf {
-        self.root.join("regions").join(format!("r.{}.{}.{}.tngr", r.x, r.y, r.z))
+    fn region_path(&self, (tier, r): RegionPos) -> PathBuf {
+        self.root.join("regions").join(format!("r{tier}.{}.{}.{}.tngr", r.x, r.y, r.z))
     }
 
-    fn with_region<T>(&self, r: IVec3, f: impl FnOnce(&mut Region) -> T) -> T {
+    fn with_region<T>(&self, r: RegionPos, f: impl FnOnce(&mut Region) -> T) -> T {
         let mut regions = self.regions.lock().unwrap();
         let region = regions.entry(r).or_insert_with(|| {
             let path = self.region_path(r);
@@ -183,14 +196,31 @@ impl Store {
         f(region)
     }
 
-    /// Saved delta of a chunk, if it has ever been edited.
-    pub fn get(&self, pos: ChunkPos) -> Option<Arc<[u8]>> {
+    /// Saved edits of a cell, if it has any.
+    pub fn get(&self, pos: CellPos) -> Option<Arc<[u8]>> {
         let (r, index) = region_of(pos);
         self.with_region(r, |region| region.chunks.get(&index).cloned())
     }
 
-    /// Record a chunk's delta. It reaches disk at the next [`flush`](Self::flush).
-    pub fn put(&self, pos: ChunkPos, bytes: Vec<u8>) {
+    /// Every saved cell of a region.
+    pub fn region(&self, r: RegionPos) -> Vec<(CellPos, Arc<[u8]>)> {
+        self.with_region(r, |region| {
+            let mut cells: Vec<(CellPos, Arc<[u8]>)> = region
+                .chunks
+                .iter()
+                .map(|(&i, bytes)| {
+                    let (i, mask) = (i as i32, (1 << REGION_BITS) - 1);
+                    let local = IVec3::new(i & mask, i >> (2 * REGION_BITS), (i >> REGION_BITS) & mask);
+                    (CellPos::new(r.0, (r.1 << REGION_BITS) + local), bytes.clone())
+                })
+                .collect();
+            cells.sort_unstable_by_key(|(p, _)| (p.pos.y, p.pos.z, p.pos.x));
+            cells
+        })
+    }
+
+    /// Record a cell's edits. They reach disk at the next [`flush`](Self::flush).
+    pub fn put(&self, pos: CellPos, bytes: Vec<u8>) {
         let (r, index) = region_of(pos);
         self.with_region(r, |region| {
             region.chunks.insert(index, Arc::from(bytes));
@@ -200,7 +230,7 @@ impl Store {
 
     /// Write every region changed since the last flush. Returns how many were written.
     pub fn flush(&self) -> io::Result<usize> {
-        let pending: Vec<(IVec3, Vec<u8>)> = {
+        let pending: Vec<(RegionPos, Vec<u8>)> = {
             let mut regions = self.regions.lock().unwrap();
             regions
                 .iter_mut()
@@ -252,12 +282,14 @@ mod tests {
     }
 
     #[test]
-    fn chunks_survive_reopen_and_corruption_is_contained() {
+    fn cells_survive_reopen_and_corruption_is_contained() {
         let dir = temp_dir("store");
         let params = WorldParams { seed: 42, cell_size: 0.25, min_fragment: 0.75 };
         let (store, got) = Store::open(&dir, params).unwrap();
         assert_eq!(got, params);
-        let (a, b, far) = (IVec3::new(3, -2, 17), IVec3::new(-1, -1, -1), IVec3::new(100, 0, 0));
+        let cell = |tier, x, y, z| CellPos::new(tier, IVec3::new(x, y, z));
+        // The same position in the other tier is a different cell.
+        let (a, b, far) = (cell(0, 3, -2, 17), cell(0, -1, -1, -1), cell(1, 3, -2, 17));
         store.put(a, vec![1, 2, 3]);
         store.put(b, vec![9; 5000]);
         store.put(far, vec![]);
@@ -273,12 +305,17 @@ mod tests {
         assert_eq!(store.get(a).as_deref(), Some(&[1u8, 2, 3][..]));
         assert_eq!(store.get(b).map(|v| v.len()), Some(5000));
         assert_eq!(store.get(far).map(|v| v.len()), Some(0));
-        assert!(store.get(IVec3::new(3, -2, 18)).is_none());
+        assert!(store.get(cell(0, 3, -2, 18)).is_none());
+        let cells: Vec<CellPos> = store.region(region_of(a).0).into_iter().map(|(p, _)| p).collect();
+        assert_eq!(cells, vec![a]);
+        assert_eq!(store.region(region_of(b).0).len(), 1);
+        assert_eq!(store.region(region_of(far).0).len(), 1);
+        assert!(store.region((0, IVec3::splat(50))).is_empty());
         drop(store);
 
         // Flip a byte in the last blob of a region file: only that chunk is lost.
-        let (r, _) = region_of(b);
-        let path = dir.join("regions").join(format!("r.{}.{}.{}.tngr", r.x, r.y, r.z));
+        let ((_, r), _) = region_of(b);
+        let path = dir.join("regions").join(format!("r0.{}.{}.{}.tngr", r.x, r.y, r.z));
         let mut bytes = fs::read(&path).unwrap();
         *bytes.last_mut().unwrap() ^= 0xff;
         fs::write(&path, &bytes).unwrap();

@@ -1,82 +1,25 @@
-//! Surface Nets meshing of one chunk from a padded copy of its samples.
+//! Surface Nets meshing of one node from its padded block of samples.
 
 use bytemuck::{Pod, Zeroable};
 use glam::{IVec3, Vec3};
 
-use crate::chunk::Chunk;
-use crate::coords::{CHUNK_SIZE, ChunkPos, SOLID, index_xyz};
+pub use crate::coords::APRON;
+use crate::coords::{self, CHUNK_SIZE, SOLID};
+use crate::field::LocalField;
 use crate::material;
 
 const N: i32 = CHUNK_SIZE;
-/// Samples of apron on each side: one for neighbouring cells, one for gradients.
-pub const APRON: i32 = 2;
-/// Samples per axis of a padded block.
-pub const PAD: usize = (N + 2 * APRON) as usize;
-const PAD3: usize = PAD * PAD * PAD;
-/// Cells per axis that get a vertex: the chunk's own plus one layer below.
-const CELLS: usize = (N + 1) as usize;
+const PAD: usize = coords::PAD as usize;
+/// Cells per axis that can get a vertex: the chunk's own plus two layers
+/// below and one above, which a mesh with a margin reaches into.
+const CELLS: usize = (N + 3) as usize;
 /// Vertex position fixed-point scale: units per cell.
 pub const POS_SCALE: u32 = 1024;
 const NO_VERTEX: u16 = u16::MAX;
 
-/// A chunk's samples plus an apron copied from its 26 neighbours.
-pub struct PaddedBlock {
-    pub fill: Box<[u8]>,
-    pub mat: Box<[u8]>,
-}
-
 #[inline]
 fn pidx(x: i32, y: i32, z: i32) -> usize {
     ((y + APRON) as usize * PAD + (z + APRON) as usize) * PAD + (x + APRON) as usize
-}
-
-impl PaddedBlock {
-    /// Copy the block for `center` out of loaded chunks. Returns `None` if a
-    /// needed neighbour is missing.
-    pub fn gather<'a>(center: ChunkPos, get: impl Fn(ChunkPos) -> Option<&'a Chunk>) -> Option<Self> {
-        let mut fill = vec![0u8; PAD3].into_boxed_slice();
-        let mut mat = vec![0u8; PAD3].into_boxed_slice();
-        for cy in -1..=1 {
-            for cz in -1..=1 {
-                for cx in -1..=1 {
-                    let chunk = get(center + IVec3::new(cx, cy, cz))?;
-                    // Range of this neighbour's local samples inside the block.
-                    let range = |c: i32| match c {
-                        -1 => (N - APRON, N),
-                        0 => (0, N),
-                        _ => (0, APRON),
-                    };
-                    let (x0, x1) = range(cx);
-                    let (y0, y1) = range(cy);
-                    let (z0, z1) = range(cz);
-                    let len = (x1 - x0) as usize;
-                    for y in y0..y1 {
-                        for z in z0..z1 {
-                            let dst = pidx(x0 + cx * N, y + cy * N, z + cz * N);
-                            match chunk {
-                                Chunk::Uniform(s) => {
-                                    fill[dst..dst + len].fill(s.fill);
-                                    mat[dst..dst + len].fill(s.mat);
-                                }
-                                Chunk::Dense(d) => {
-                                    let src = index_xyz(x0, y, z);
-                                    fill[dst..dst + len].copy_from_slice(&d.fill[src..src + len]);
-                                    mat[dst..dst + len].copy_from_slice(&d.mat[src..src + len]);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        Some(Self { fill, mat })
-    }
-
-    /// True if no surface can pass through the block.
-    pub fn is_homogeneous(&self) -> bool {
-        let first = self.fill[0] >= SOLID;
-        self.fill.iter().all(|&f| (f >= SOLID) == first)
-    }
 }
 
 /// GPU vertex, 12 bytes.
@@ -211,10 +154,14 @@ pub fn quad_split(p: [Vec3; 4]) -> [usize; 6] {
 
 #[inline]
 fn cidx(x: i32, y: i32, z: i32) -> usize {
-    ((y + 1) as usize * CELLS + (z + 1) as usize) * CELLS + (x + 1) as usize
+    ((y + 2) as usize * CELLS + (z + 2) as usize) * CELLS + (x + 2) as usize
 }
 
-pub fn mesh_block(block: &PaddedBlock) -> ChunkMesh {
+/// Mesh the padded block of a node. `margin` (0 or 1) is how many cells the
+/// mesh reaches beyond the chunk on every side: a coarse node overlaps its
+/// neighbours by one cell so that no gap opens against a finer one.
+pub fn mesh_block(block: &LocalField, margin: i32) -> ChunkMesh {
+    debug_assert!(block.dims == IVec3::splat(coords::PAD) && (0..=1).contains(&margin));
     let mut mesh = ChunkMesh::default();
     if block.is_homogeneous() {
         return mesh;
@@ -228,9 +175,10 @@ pub fn mesh_block(block: &PaddedBlock) -> ChunkMesh {
         CORNERS[c][1] as usize * PAD * PAD + CORNERS[c][2] as usize * PAD + CORNERS[c][0] as usize
     });
 
-    for y in -1..N {
-        for z in -1..N {
-            for x in -1..N {
+    let (lo, hi) = (-margin, N + margin);
+    for y in lo - 1..hi {
+        for z in lo - 1..hi {
+            for x in lo - 1..hi {
                 let base = pidx(x, y, z);
                 let f: [u8; 8] = std::array::from_fn(|c| fill[base + corner_off[c]]);
                 let mask = solid_mask(&f);
@@ -278,7 +226,8 @@ pub fn mesh_block(block: &PaddedBlock) -> ChunkMesh {
     }
 
     // One quad per owned lattice edge that crosses the surface. An edge is
-    // owned by the chunk holding its lower sample.
+    // owned by the chunk holding its lower sample; a margin adds the edges of
+    // one more layer of samples all round.
     //
     // A quad is the face of the solid sample on its edge and takes that
     // sample's material whole, so materials meet at a hard line. A shared
@@ -287,9 +236,9 @@ pub fn mesh_block(block: &PaddedBlock) -> ChunkMesh {
     // Triangles of faceted materials get three vertices of their own carrying
     // the face normal, so they shade flat with no per-pixel derivatives.
     let mut variants = vec![[NO_VERTEX; 4]; mesh.vertices.len()];
-    for y in 0..N {
-        for z in 0..N {
-            for x in 0..N {
+    for y in lo..hi {
+        for z in lo..hi {
+            for x in lo..hi {
                 let i = pidx(x, y, z);
                 let s0 = fill[i] >= SOLID;
                 for (off, cells) in [1, PAD * PAD, PAD].into_iter().zip(EDGE_CELLS) {
@@ -370,9 +319,18 @@ pub fn mesh_block(block: &PaddedBlock) -> ChunkMesh {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chunk::{Dense, Sample, Volume};
-    use crate::coords::chunk_origin;
-    use std::collections::HashMap;
+    use crate::chunk::{Chunk, Dense, Sample, Volume};
+    use crate::coords::{NodeKey, chunk_origin, index_xyz};
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+
+    fn block_of(vol: &Volume, pos: IVec3) -> LocalField {
+        let chunks: [Arc<Chunk>; 27] = std::array::from_fn(|i| {
+            let i = i as i32;
+            vol.chunks[&(pos + IVec3::new(i % 3, i / 9, i / 3 % 3) - 1)].clone()
+        });
+        LocalField::gather(NodeKey::new(0, pos), &chunks)
+    }
 
     /// A ball of stone spanning the eight chunks around the origin.
     fn ball_volume(radius: f32, center: Vec3) -> Volume {
@@ -422,8 +380,7 @@ mod tests {
             for cz in -1..1 {
                 for cx in -1..1 {
                     let pos = IVec3::new(cx, cy, cz);
-                    let block = PaddedBlock::gather(pos, |p| vol.chunk(p)).unwrap();
-                    let mesh = mesh_block(&block);
+                    let mesh = mesh_block(&block_of(&vol, pos), 0);
                     let world = |i: u16| {
                         let v = mesh.vertices[i as usize].pos;
                         let o = (chunk_origin(pos) - APRON) * POS_SCALE as i32;
@@ -468,9 +425,28 @@ mod tests {
                 }
             }
         }
-        let block = PaddedBlock::gather(IVec3::ZERO, |p| vol.chunk(p)).unwrap();
-        assert!(mesh_block(&block).is_empty());
-        assert!(PaddedBlock::gather(IVec3::splat(1), |p| vol.chunk(p)).is_none());
+        assert!(mesh_block(&block_of(&vol, IVec3::ZERO), 0).is_empty());
+        assert!(mesh_block(&block_of(&vol, IVec3::ZERO), 1).is_empty());
+    }
+
+    #[test]
+    fn a_margin_adds_a_border_and_changes_nothing_else() {
+        let vol = ball_volume(20.0, Vec3::new(0.7, -1.3, 2.1));
+        let block = block_of(&vol, IVec3::new(-1, 0, 0));
+        let triangles = |margin: i32| -> HashSet<[[u16; 3]; 3]> {
+            let mesh = mesh_block(&block, margin);
+            mesh.indices.chunks_exact(3).map(|t| [t[0], t[1], t[2]].map(|i| mesh.vertices[i as usize].pos)).collect()
+        };
+        let (own, wide) = (triangles(0), triangles(1));
+        assert!(own.is_subset(&wide));
+        assert!(wide.len() > own.len() + 100, "{} -> {}", own.len(), wide.len());
+        // The extra triangles reach past the chunk on both sides.
+        let span = |set: &HashSet<[[u16; 3]; 3]>| {
+            let xs = set.iter().flatten().map(|p| p[0]);
+            (xs.clone().min().unwrap(), xs.max().unwrap())
+        };
+        let ((a0, a1), (b0, b1)) = (span(&own), span(&wide));
+        assert!(b0 < a0 && b1 > a1 && a0 - b0 <= POS_SCALE as u16 * 2);
     }
 
     #[test]
@@ -501,7 +477,7 @@ mod tests {
             for cz in -1..1 {
                 for cx in -1..1 {
                     let pos = IVec3::new(cx, cy, cz);
-                    let mesh = mesh_block(&PaddedBlock::gather(pos, |p| vol.chunk(p)).unwrap());
+                    let mesh = mesh_block(&block_of(&vol, pos), 0);
                     for t in mesh.indices.chunks_exact(3) {
                         let m = [t[0], t[1], t[2]].map(|i| mesh.vertices[i as usize].mat_sharp & 0xff);
                         assert!(m[0] == m[1] && m[1] == m[2], "triangle blends materials {m:?}");

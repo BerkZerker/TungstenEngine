@@ -1,18 +1,22 @@
-//! World generation: a pure function from `(seed, chunk)` to samples.
+//! World generation: a pure function from `(seed, node)` to samples.
 //!
 //! Part of the bit-exact contract. Float use is restricted to `+ - * /`,
 //! `sqrt`, `floor` and comparisons; see `noise.rs`.
+//!
+//! Every level of detail samples the same terrain at its own spacing. Caves
+//! are left out of the two coarsest levels, whose cells are wider than a tunnel.
 
 use std::sync::{Arc, Mutex};
 
-use crate::chunk::{Chunk, Dense, Sample};
-use crate::coords::{CHUNK_SIZE, ChunkPos, FILL_PER_CELL, WorldParams, index_xyz};
+use crate::chunk::Sample;
+use crate::coords::{APRON, CHUNK_SIZE, FILL_PER_CELL, NodeKey, PAD, WorldParams};
+use crate::field::LocalField;
 use crate::hash::{IntMap, derive};
 use crate::material::Material;
 use crate::noise::{fbm2, noise2, noise3, ridged2, smoothstep};
 
-/// Bump whenever generated output changes; saved deltas are tied to it.
-pub const GENERATOR_VERSION: u32 = 2;
+/// Bump whenever generated output changes; saved edits are tied to it.
+pub const GENERATOR_VERSION: u32 = 3;
 
 /// Mountains: metres between ranges, between ridges, and peak height.
 const MASK_WAVE: f64 = 800.0;
@@ -21,12 +25,13 @@ const MASK_TO: f32 = 0.3;
 const RIDGE_WAVE: f64 = 450.0;
 const MOUNTAIN_HEIGHT: f32 = 170.0;
 
-const N: usize = CHUNK_SIZE as usize;
-const AREA: usize = N * N;
-/// Cells between points of the coarse lattice that 3D noise is evaluated on.
-const COARSE: usize = 4;
-const LAT: usize = N / COARSE + 1;
-const LAT3: usize = LAT * LAT * LAT;
+/// Samples per axis of a block, and of one of its horizontal slices.
+const P: usize = PAD as usize;
+const AREA: usize = P * P;
+/// Lattice coordinates of 3D noise start this many samples before the block.
+const LAT_PAD: usize = 1;
+/// Samples the noise lattice has to span: the block and its padding.
+const LAT_SPAN: usize = P + 2 * LAT_PAD - 1;
 
 /// Ground below this height is sand, metres.
 pub const SAND_LINE: f32 = 0.0;
@@ -41,6 +46,8 @@ const CAVE_R_MAX: f32 = 0.09;
 const CAVE_SCALE: f32 = 45.0;
 /// Depth over which caves fade in below their opening depth, metres.
 const CAVE_FADE: f32 = 6.0;
+/// Coarsest level that still has caves.
+const CAVE_LEVELS: u8 = 3;
 
 struct Seeds {
     cont: u64,
@@ -58,18 +65,18 @@ struct Seeds {
     cave3: u64,
 }
 
-/// Per-column terrain data shared by every chunk in a vertical stack.
+/// Per-column terrain data shared by every node in a vertical stack.
 struct Column {
-    height: [f32; AREA],
+    height: Vec<f32>,
     /// 1 / sqrt(1 + slope²): turns vertical depth into approximate distance.
-    inv_grad: [f32; AREA],
+    inv_grad: Vec<f32>,
     /// Amplitude of the 3D cliff/overhang term, metres.
-    cliff: [f32; AREA],
+    cliff: Vec<f32>,
     /// Thickness of the loose layer over the bedrock, metres, and what it is.
-    cover: [f32; AREA],
-    cover_mat: [u8; AREA],
+    cover: Vec<f32>,
+    cover_mat: Vec<u8>,
     /// Depth at which caves start to fade in; negative lets them breach the surface.
-    open: [f32; AREA],
+    open: Vec<f32>,
     min_h: f32,
     max_h: f32,
     max_cliff: f32,
@@ -77,10 +84,56 @@ struct Column {
     min_open: f32,
 }
 
+/// What a generated block turned out to be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Generated {
+    /// Every sample is this one; the field was filled with it.
+    Uniform(Sample),
+    Mixed,
+}
+
+/// 3D noise on a lattice coarser than the samples, interpolated between.
+struct Lattice {
+    /// Samples between lattice points.
+    every: usize,
+    /// Lattice points per axis.
+    n: usize,
+    values: Vec<f32>,
+}
+
+impl Lattice {
+    fn empty() -> Self {
+        Self { every: 1, n: 0, values: Vec::new() }
+    }
+
+    /// Interpolate along Y and Z at block sample `(y, z)`, leaving one value per lattice X.
+    #[inline]
+    fn row(&self, y: usize, z: usize, row: &mut [f32]) {
+        let inv = 1.0 / self.every as f32;
+        let (y, z) = (y + LAT_PAD, z + LAT_PAD);
+        let (ly, ty) = (y / self.every, (y % self.every) as f32 * inv);
+        let (lz, tz) = (z / self.every, (z % self.every) as f32 * inv);
+        let (n, b) = (self.n, (ly * self.n + lz) * self.n);
+        let v = &self.values;
+        for (lx, out) in row[..n].iter_mut().enumerate() {
+            let a = v[b + lx] + (v[b + n + lx] - v[b + lx]) * tz;
+            let c = v[b + n * n + lx] + (v[b + n * n + n + lx] - v[b + n * n + lx]) * tz;
+            *out = a + (c - a) * ty;
+        }
+    }
+
+    #[inline]
+    fn at(&self, row: &[f32], x: usize) -> f32 {
+        let x = x + LAT_PAD;
+        let (lx, tx) = (x / self.every, (x % self.every) as f32 * (1.0 / self.every as f32));
+        row[lx] + (row[lx + 1] - row[lx]) * tx
+    }
+}
+
 pub struct Generator {
     params: WorldParams,
     seeds: Seeds,
-    columns: Mutex<IntMap<(i32, i32), Arc<Column>>>,
+    columns: Mutex<IntMap<(u8, i32, i32), Arc<Column>>>,
 }
 
 impl Generator {
@@ -123,68 +176,74 @@ impl Generator {
         cont * 40.0 + hills * 14.0 + mask * ridge * MOUNTAIN_HEIGHT + detail * 1.2
     }
 
-    fn column(&self, cx: i32, cz: i32) -> Arc<Column> {
-        if let Some(c) = self.columns.lock().unwrap().get(&(cx, cz)) {
+    /// Heights the terrain surface can reach, metres: lowest valley floor to highest peak.
+    pub fn height_range(&self) -> (f32, f32) {
+        (-60.0, 60.0 + MOUNTAIN_HEIGHT)
+    }
+
+    fn column(&self, level: u8, cx: i32, cz: i32) -> Arc<Column> {
+        if let Some(c) = self.columns.lock().unwrap().get(&(level, cx, cz)) {
             return c.clone();
         }
-        let col = Arc::new(self.build_column(cx, cz));
+        let col = Arc::new(self.build_column(level, cx, cz));
         let mut cache = self.columns.lock().unwrap();
-        if cache.len() > 8192 {
+        if cache.len() > 3000 {
             cache.clear();
         }
-        cache.insert((cx, cz), col.clone());
+        cache.insert((level, cx, cz), col.clone());
         col
     }
 
-    fn build_column(&self, cx: i32, cz: i32) -> Column {
+    fn build_column(&self, level: u8, cx: i32, cz: i32) -> Column {
         let s = &self.seeds;
-        let cell = self.params.cell_size as f64;
-        let (ox, oz) = (cx as i64 * N as i64, cz as i64 * N as i64);
+        // Metres per sample of this level, and the lattice coordinate of the block's first sample.
+        let spacing = self.params.cell_size as f64 * (1u64 << level) as f64;
+        let (ox, oz) = (cx as i64 * CHUNK_SIZE as i64 - APRON as i64, cz as i64 * CHUNK_SIZE as i64 - APRON as i64);
 
         // Heights with a one-sample border for slope by central difference.
-        const W: usize = N + 2;
-        let mut h = [0.0f32; W * W];
+        const W: usize = P + 2;
+        let mut h = vec![0.0f32; W * W];
         for z in 0..W {
             for x in 0..W {
-                let wx = (ox + x as i64 - 1) as f64 * cell;
-                let wz = (oz + z as i64 - 1) as f64 * cell;
+                let wx = (ox + x as i64 - 1) as f64 * spacing;
+                let wz = (oz + z as i64 - 1) as f64 * spacing;
                 h[z * W + x] = self.surface_height(wx, wz);
             }
         }
 
         let mut col = Column {
-            height: [0.0; AREA],
-            inv_grad: [0.0; AREA],
-            cliff: [0.0; AREA],
-            cover: [0.0; AREA],
-            cover_mat: [Material::STONE; AREA],
-            open: [0.0; AREA],
+            height: vec![0.0; AREA],
+            inv_grad: vec![0.0; AREA],
+            cliff: vec![0.0; AREA],
+            cover: vec![0.0; AREA],
+            cover_mat: vec![Material::STONE; AREA],
+            open: vec![0.0; AREA],
             min_h: f32::MAX,
             max_h: f32::MIN,
             max_cliff: 0.0,
             min_inv_grad: 1.0,
             min_open: f32::MAX,
         };
-        let inv_2cell = 0.5 / self.params.cell_size;
-        for z in 0..N {
-            for x in 0..N {
-                let i = z * N + x;
+        let inv_2step = (0.5 / spacing) as f32;
+        for z in 0..P {
+            for x in 0..P {
+                let i = z * P + x;
                 let c = (z + 1) * W + x + 1;
                 let height = h[c];
-                let gx = (h[c + 1] - h[c - 1]) * inv_2cell;
-                let gz = (h[c + W] - h[c - W]) * inv_2cell;
+                let gx = (h[c + 1] - h[c - 1]) * inv_2step;
+                let gz = (h[c + W] - h[c - W]) * inv_2step;
                 let slope2 = gx * gx + gz * gz;
                 let inv_grad = 1.0 / (1.0 + slope2).sqrt();
-                let wx = (ox + x as i64) as f64 * cell;
-                let wz = (oz + z as i64) as f64 * cell;
+                let wx = (ox + x as i64) as f64 * spacing;
+                let wz = (oz + z as i64) as f64 * spacing;
 
                 // One biome, banded by altitude: sand lowlands, dirt midlands,
                 // stone highlands. The lines wander a little so they do not
                 // trace exact contours.
-                let level = height + LINE_WOBBLE * noise2(s.band, wx / 70.0, wz / 70.0);
-                let (cover_mat, cover) = if level < SAND_LINE {
+                let band = height + LINE_WOBBLE * noise2(s.band, wx / 70.0, wz / 70.0);
+                let (cover_mat, cover) = if band < SAND_LINE {
                     (Material::SAND, 5.0)
-                } else if level < STONE_LINE {
+                } else if band < STONE_LINE {
                     (Material::DIRT, 3.0 + 1.5 * noise2(s.dirt, wx / 50.0, wz / 50.0))
                 } else {
                     (Material::STONE, 0.0)
@@ -194,7 +253,7 @@ impl Generator {
                 // above the stone line keeps bedrock from showing through dirt.
                 let cliff = 9.0
                     * smoothstep(0.15, 0.6, noise2(s.cliff, wx / 260.0, wz / 260.0))
-                    * smoothstep(STONE_LINE + 4.0, STONE_LINE + 24.0, level);
+                    * smoothstep(STONE_LINE + 4.0, STONE_LINE + 24.0, band);
 
                 let open = 7.0 - 10.0 * smoothstep(0.4, 0.55, noise2(s.open, wx / 140.0, wz / 140.0));
 
@@ -214,101 +273,124 @@ impl Generator {
         col
     }
 
-    /// 3D noise on the coarse lattice of a chunk. Lattice points on chunk
-    /// faces are shared with the neighbour, so interpolation is seamless.
-    fn lattice(&self, seed: u64, origin: [i64; 3], wave: [f64; 3]) -> [f32; LAT3] {
-        let cell = self.params.cell_size as f64;
-        let mut out = [0.0f32; LAT3];
-        for ly in 0..LAT {
-            let y = (origin[1] + (ly * COARSE) as i64) as f64 * cell / wave[1];
-            for lz in 0..LAT {
-                let z = (origin[2] + (lz * COARSE) as i64) as f64 * cell / wave[2];
-                for lx in 0..LAT {
-                    let x = (origin[0] + (lx * COARSE) as i64) as f64 * cell / wave[0];
-                    out[(ly * LAT + lz) * LAT + lx] = noise3(seed, x, y, z);
+    /// 3D noise on the lattice of a block. Lattice points sit at multiples of
+    /// `every` samples of the level, so neighbouring blocks agree on them.
+    fn lattice(&self, seed: u64, level: u8, origin: [i64; 3], wave: [f64; 3]) -> Lattice {
+        // About a metre apart at the fine levels, never further than the samples.
+        let every = (4usize >> level.saturating_sub(2)).max(1);
+        let n = LAT_SPAN.div_ceil(every) + 1;
+        let spacing = self.params.cell_size as f64 * (1u64 << level) as f64;
+        let mut values = vec![0.0f32; n * n * n];
+        let at = |a: usize, l: usize| (origin[a] - LAT_PAD as i64 + (l * every) as i64) as f64 * spacing / wave[a];
+        for ly in 0..n {
+            let y = at(1, ly);
+            for lz in 0..n {
+                let z = at(2, lz);
+                for lx in 0..n {
+                    values[(ly * n + lz) * n + lx] = noise3(seed, at(0, lx), y, z);
                 }
             }
         }
-        out
+        Lattice { every, n, values }
     }
 
-    pub fn generate(&self, pos: ChunkPos) -> Chunk {
-        let cell = self.params.cell_size;
-        let col = self.column(pos.x, pos.z);
-        let origin = [pos.x as i64 * N as i64, pos.y as i64 * N as i64, pos.z as i64 * N as i64];
-        let y_min = (origin[1] as f64 * cell as f64) as f32;
-        let y_max = ((origin[1] + N as i64 - 1) as f64 * cell as f64) as f32;
-        let band = 2.1 * cell;
+    /// Fill `field`, the padded block of `key`, with generated terrain.
+    pub fn fill_block(&self, key: NodeKey, field: &mut LocalField) -> Generated {
+        debug_assert!(field.dims == glam::IVec3::splat(PAD) && field.level == key.level);
+        let level = key.level;
+        let spacing = self.params.spacing(level);
+        let col = self.column(level, key.pos.x, key.pos.z);
+        // Lattice coordinate of the block's first sample.
+        let origin: [i64; 3] = std::array::from_fn(|a| key.pos[a] as i64 * CHUNK_SIZE as i64 - APRON as i64);
+        debug_assert!(origin.iter().all(|o| (o - LAT_PAD as i64).rem_euclid(4) == 0));
+        let y_min = (origin[1] as f64 * spacing as f64) as f32;
+        let y_max = ((origin[1] + P as i64 - 1) as f64 * spacing as f64) as f32;
+        let band = 2.1 * spacing;
 
         // Entirely above anything the surface terms can reach: air.
         if (y_min - col.max_h) * col.min_inv_grad > 1.1 * col.max_cliff + band {
-            return Chunk::AIR;
+            field.set_all(Sample::AIR);
+            return Generated::Uniform(Sample::AIR);
         }
 
         // So deep that the surface terms saturate; only caves can matter.
         let top_depth = col.min_h - y_max;
         let deep = top_depth * col.min_inv_grad > 1.1 * col.max_cliff + band && top_depth > 14.0;
         let need_over = !deep && col.max_cliff > 0.0;
-        let need_cave = col.max_h - y_min > col.min_open;
+        let need_cave = level <= CAVE_LEVELS && col.max_h - y_min > col.min_open;
 
-        let over = if need_over { self.lattice(self.seeds.over, origin, [34.0, 24.0, 34.0]) } else { [0.0; LAT3] };
+        let over =
+            if need_over { self.lattice(self.seeds.over, level, origin, [34.0, 24.0, 34.0]) } else { Lattice::empty() };
         let (c1, c2, c3) = if need_cave {
             (
-                self.lattice(self.seeds.cave1, origin, [90.0, 55.0, 90.0]),
-                self.lattice(self.seeds.cave2, origin, [90.0, 55.0, 90.0]),
-                self.lattice(self.seeds.cave3, origin, [260.0, 160.0, 260.0]),
+                self.lattice(self.seeds.cave1, level, origin, [90.0, 55.0, 90.0]),
+                self.lattice(self.seeds.cave2, level, origin, [90.0, 55.0, 90.0]),
+                self.lattice(self.seeds.cave3, level, origin, [260.0, 160.0, 260.0]),
             )
         } else {
-            ([0.0; LAT3], [0.0; LAT3], [0.0; LAT3])
+            (Lattice::empty(), Lattice::empty(), Lattice::empty())
         };
 
-        if deep && !may_have_cave(&c1, &c2) {
-            return Chunk::Uniform(Sample { fill: 255, mat: Material::STONE });
+        let rock = Sample { fill: 255, mat: Material::STONE };
+        if deep && !(need_cave && may_have_cave(&c1, &c2)) {
+            field.set_all(rock);
+            return Generated::Uniform(rock);
         }
 
-        let mut dense = Dense::new_boxed(Sample::AIR);
-        let fill_per_metre = FILL_PER_CELL as f32 / cell;
-        let (mut r_over, mut r1, mut r2, mut r3) = ([0.0f32; LAT], [0.0f32; LAT], [0.0f32; LAT], [0.0f32; LAT]);
-        for y in 0..N {
-            let ym = (origin[1] + y as i64) as f64 * cell as f64;
-            for z in 0..N {
+        field.set_all(Sample::AIR);
+        let fill_per_metre = FILL_PER_CELL as f32 / spacing;
+        let skin = 1.5 * spacing;
+        let rows = LAT_SPAN + 2;
+        let (mut r_over, mut r1, mut r2, mut r3) =
+            (vec![0.0f32; rows], vec![0.0f32; rows], vec![0.0f32; rows], vec![0.0f32; rows]);
+        let (mut any_air, mut all_rock) = (false, true);
+        for y in 0..P {
+            let ym = (origin[1] + y as i64) as f64 * spacing as f64;
+            for z in 0..P {
                 if need_over {
-                    lattice_row(&over, y, z, &mut r_over);
+                    over.row(y, z, &mut r_over);
                 }
                 if need_cave {
-                    lattice_row(&c1, y, z, &mut r1);
-                    lattice_row(&c2, y, z, &mut r2);
-                    lattice_row(&c3, y, z, &mut r3);
+                    c1.row(y, z, &mut r1);
+                    c2.row(y, z, &mut r2);
+                    c3.row(y, z, &mut r3);
                 }
-                for x in 0..N {
-                    let ci = z * N + x;
+                let base = (y * P + z) * P;
+                for x in 0..P {
+                    let ci = z * P + x;
                     let depth = (col.height[ci] as f64 - ym) as f32;
                     let mut d = depth * col.inv_grad[ci];
                     if need_over {
-                        d += col.cliff[ci] * row_at(&r_over, x);
+                        d += col.cliff[ci] * over.at(&r_over, x);
                     }
                     if need_cave {
                         let fade = ((depth - col.open[ci]) / CAVE_FADE).clamp(0.0, 1.0);
                         if fade > 0.0 {
-                            let (a, b) = (row_at(&r1, x), row_at(&r2, x));
-                            let r = cave_radius(row_at(&r3, x)) * fade;
+                            let (a, b) = (c1.at(&r1, x), c2.at(&r2, x));
+                            let r = cave_radius(c3.at(&r3, x)) * fade;
                             d = d.min(((a * a + b * b).sqrt() - r) * CAVE_SCALE);
                         }
                     }
                     let fill = ((127.5 + d * fill_per_metre).clamp(0.0, 255.0) + 0.5) as u8;
                     if fill == 0 {
+                        any_air = true;
                         continue;
                     }
-                    let mat = if depth < col.cover[ci] { col.cover_mat[ci] } else { Material::STONE };
-                    let i = index_xyz(x as i32, y as i32, z as i32);
-                    dense.fill[i] = fill;
-                    dense.mat[i] = mat;
+                    // The sample nearest the surface is what gets drawn. Where
+                    // the cover is thinner than the cells of this level, that
+                    // sample still has to be cover, or bedrock shows through.
+                    let covered = depth < col.cover[ci] || depth * col.inv_grad[ci] < skin;
+                    let mat = if covered { col.cover_mat[ci] } else { Material::STONE };
+                    all_rock &= fill == 255 && mat == Material::STONE;
+                    field.fill[base + x] = fill;
+                    field.mat[base + x] = mat;
                 }
             }
         }
-        let mut chunk = Chunk::Dense(dense);
-        chunk.normalize();
-        chunk
+        if all_rock && !any_air {
+            return Generated::Uniform(rock);
+        }
+        if field.fill.iter().all(|&f| f == 0) { Generated::Uniform(Sample::AIR) } else { Generated::Mixed }
     }
 }
 
@@ -318,14 +400,15 @@ fn cave_radius(c3: f32) -> f32 {
 }
 
 /// Conservative test: can any interpolated point of these lattices be inside a cave?
-fn may_have_cave(c1: &[f32; LAT3], c2: &[f32; LAT3]) -> bool {
+fn may_have_cave(c1: &Lattice, c2: &Lattice) -> bool {
     let limit = CAVE_R_MAX * CAVE_R_MAX;
-    let min_abs = |lat: &[f32; LAT3], base: usize| {
+    let n = c1.n;
+    let min_abs = |lat: &Lattice, base: usize| {
         let (mut lo, mut hi) = (f32::MAX, f32::MIN);
         for dy in 0..2 {
             for dz in 0..2 {
                 for dx in 0..2 {
-                    let v = lat[base + (dy * LAT + dz) * LAT + dx];
+                    let v = lat.values[base + (dy * n + dz) * n + dx];
                     lo = lo.min(v);
                     hi = hi.max(v);
                 }
@@ -333,10 +416,10 @@ fn may_have_cave(c1: &[f32; LAT3], c2: &[f32; LAT3]) -> bool {
         }
         if lo <= 0.0 && hi >= 0.0 { 0.0 } else { lo.abs().min(hi.abs()) }
     };
-    for ly in 0..LAT - 1 {
-        for lz in 0..LAT - 1 {
-            for lx in 0..LAT - 1 {
-                let base = (ly * LAT + lz) * LAT + lx;
+    for ly in 0..n - 1 {
+        for lz in 0..n - 1 {
+            for lx in 0..n - 1 {
+                let base = (ly * n + lz) * n + lx;
                 let (a, b) = (min_abs(c1, base), min_abs(c2, base));
                 if a * a + b * b <= limit {
                     return true;
@@ -347,75 +430,100 @@ fn may_have_cave(c1: &[f32; LAT3], c2: &[f32; LAT3]) -> bool {
     false
 }
 
-/// Interpolate a lattice along Y and Z, leaving one value per lattice X.
-#[inline]
-fn lattice_row(lat: &[f32; LAT3], y: usize, z: usize, row: &mut [f32; LAT]) {
-    let (ly, ty) = (y / COARSE, (y % COARSE) as f32 * (1.0 / COARSE as f32));
-    let (lz, tz) = (z / COARSE, (z % COARSE) as f32 * (1.0 / COARSE as f32));
-    let b = (ly * LAT + lz) * LAT;
-    for (lx, out) in row.iter_mut().enumerate() {
-        let v00 = lat[b + lx];
-        let v01 = lat[b + LAT + lx];
-        let v10 = lat[b + LAT * LAT + lx];
-        let v11 = lat[b + LAT * LAT + LAT + lx];
-        let a = v00 + (v01 - v00) * tz;
-        let c = v10 + (v11 - v10) * tz;
-        *out = a + (c - a) * ty;
-    }
-}
-
-#[inline]
-fn row_at(row: &[f32; LAT], x: usize) -> f32 {
-    let (lx, tx) = (x / COARSE, (x % COARSE) as f32 * (1.0 / COARSE as f32));
-    row[lx] + (row[lx + 1] - row[lx]) * tx
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coords::{MAX_LEVEL, SOLID};
     use glam::IVec3;
+
+    fn block(g: &Generator, level: u8, pos: IVec3) -> (LocalField, Generated) {
+        let key = NodeKey::new(level, pos);
+        let mut f = LocalField::block(key);
+        let kind = g.fill_block(key, &mut f);
+        (f, kind)
+    }
 
     #[test]
     fn deterministic_and_cache_independent() {
         let a = Generator::new(WorldParams::default());
         let b = Generator::new(WorldParams::default());
-        for &p in &[IVec3::new(0, 0, 0), IVec3::new(3, -1, -7), IVec3::new(-20, 2, 11)] {
-            let x = a.generate(p);
+        for (level, p) in [(0, IVec3::new(0, 0, 0)), (1, IVec3::new(3, -1, -7)), (4, IVec3::new(-20, 0, 11))] {
+            let x = block(&a, level, p).0;
             // Second generator has a cold column cache and a different call order.
-            let _ = b.generate(p + IVec3::Y);
-            assert!(x == b.generate(p) && x == a.generate(p));
+            let _ = block(&b, level, p + IVec3::Y);
+            let (y, z) = (block(&b, level, p).0, block(&a, level, p).0);
+            assert!(x.fill == y.fill && x.mat == y.mat && x.fill == z.fill && x.mat == z.mat);
         }
     }
 
     #[test]
-    fn surface_exists_near_origin() {
+    fn neighbouring_blocks_agree_where_they_overlap() {
         let g = Generator::new(WorldParams::default());
-        let mut dense = 0;
-        for cy in -4..6 {
-            if !g.generate(IVec3::new(0, cy, 0)).is_uniform() {
-                dense += 1;
+        for level in 0..=MAX_LEVEL {
+            // A column of blocks that crosses the surface near the origin.
+            let ground = g.surface_height(0.0, 0.0) / g.params().spacing(level);
+            let cy = (ground / CHUNK_SIZE as f32).floor() as i32;
+            let (a, _) = block(&g, level, IVec3::new(0, cy, 0));
+            for axis in 0..3 {
+                let mut offset = IVec3::ZERO;
+                offset[axis] = 1;
+                let (b, _) = block(&g, level, IVec3::new(0, cy, 0) + offset);
+                // `b`'s low apron is `a`'s high interior and the other way round.
+                for u in 0..PAD {
+                    for v in 0..PAD {
+                        for w in 0..2 * APRON {
+                            let mut pa = IVec3::new(u, v, 0);
+                            pa[axis] = CHUNK_SIZE + w;
+                            pa[(axis + 1) % 3] = u;
+                            pa[(axis + 2) % 3] = v;
+                            let mut pb = pa;
+                            pb[axis] = w;
+                            assert_eq!(a.get(pa.x, pa.y, pa.z), b.get(pb.x, pb.y, pb.z), "level {level} axis {axis}");
+                        }
+                    }
+                }
             }
         }
-        assert!(dense >= 1, "no surface found near the origin");
+    }
+
+    #[test]
+    fn every_level_has_the_surface_at_the_same_height() {
+        let g = Generator::new(WorldParams::default());
+        let (x, z) = (40.0f64, -24.0f64);
+        let height = g.surface_height(x, z);
+        for level in 0..=MAX_LEVEL {
+            let spacing = g.params().spacing(level) as f64;
+            // The sample column at (x, z), which is on every level's lattice.
+            let (sx, sz) = ((x / spacing) as i32, (z / spacing).floor() as i32);
+            let sy = (height as f64 / spacing).floor() as i32;
+            let sample = |y: i32| {
+                let p = IVec3::new(sx, y, sz);
+                let (f, _) = block(&g, level, crate::coords::chunk_of(p));
+                let l = crate::coords::local_of(p) + APRON;
+                f.get(l.x, l.y, l.z)
+            };
+            assert!(sample(sy - 2).fill >= SOLID, "level {level}: ground missing below the surface");
+            assert!(sample(sy + 3).fill < SOLID, "level {level}: ground above the surface");
+        }
     }
 
     #[test]
     fn sky_is_air_and_depths_are_solid() {
         let g = Generator::new(WorldParams::default());
-        assert!(g.generate(IVec3::new(0, 40, 0)) == Chunk::AIR);
-        let mut solid = 0;
-        for x in 0..40 {
-            let c = g.generate(IVec3::new(x * 3, -40, 5));
-            if c == Chunk::Uniform(Sample { fill: 255, mat: Material::STONE }) {
-                solid += 1;
-            }
-        }
+        assert_eq!(block(&g, 0, IVec3::new(0, 80, 0)).1, Generated::Uniform(Sample::AIR));
+        assert_eq!(block(&g, MAX_LEVEL, IVec3::new(0, 3, 0)).1, Generated::Uniform(Sample::AIR));
+        let rock = Generated::Uniform(Sample { fill: 255, mat: Material::STONE });
+        let solid = (0..40).filter(|&x| block(&g, 1, IVec3::new(x * 3, -40, 5)).1 == rock).count();
         assert!(solid >= 16, "deep chunks should mostly be uniform stone, got {solid}/40");
+        // Uniform results fill the field too.
+        let (f, kind) = block(&g, MAX_LEVEL, IVec3::new(0, -3, 0));
+        assert_eq!(kind, rock);
+        assert!(f.fill.iter().all(|&v| v == 255) && f.mat.iter().all(|&m| m == Material::STONE));
     }
 
     #[test]
     fn lowlands_are_sand_midlands_dirt_and_highlands_stone() {
-        let params = WorldParams::default();
+        let params = WorldParams { cell_size: 0.5, ..WorldParams::default() };
         let g = Generator::new(params);
         let cell = params.cell_size as f64;
         let mut seen = [0usize; 4];
@@ -436,14 +544,15 @@ mod tests {
             // The highest solid sample of the column, if the surface is where
             // the height says (not cut by a cave mouth or raised by a cliff).
             let y0 = (height as f64 / cell).floor() as i64;
-            let sample = |y: i64| {
-                let p = IVec3::new(x as i32, y as i32, z as i32);
-                g.generate(crate::coords::chunk_of(p)).get(crate::coords::index(crate::coords::local_of(p)))
-            };
-            if !sample(y0 - 1).solid() || sample(y0 + 2).solid() {
+            let p = IVec3::new(x as i32, y0 as i32, z as i32);
+            let chunk = crate::coords::chunk_of(p);
+            let (f, _) = block(&g, 0, chunk);
+            let l = p - crate::coords::chunk_origin(chunk) + APRON;
+            let sample = |dy: i32| f.get(l.x, l.y + dy, l.z);
+            if !sample(-1).solid() || sample(2).solid() {
                 continue;
             }
-            let top = (y0 - 1..=y0 + 1).rev().map(sample).find(|s| s.solid()).unwrap();
+            let top = (-1..=1).rev().map(sample).find(|s| s.solid()).unwrap();
             assert_eq!(top.mat, expect, "at {x} {z}, height {height}");
             seen[expect as usize] += 1;
         }

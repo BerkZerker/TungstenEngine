@@ -16,12 +16,16 @@ struct Globals {
 
 @group(0) @binding(0) var<uniform> g: Globals;
 
+// How far back coarser nodes are depth-tested, in their own cells.
+const DEPTH_PUSH: f32 = 2.0;
+
 struct VsIn {
     // xyz: (cells + 2) * 1024, w: material in the low byte.
     @location(0) pos: vec4<u32>,
     @location(1) normal: vec2<f32>,
-    // Per-chunk origin relative to the camera chunk's origin, in cells, less
-    // the apron: always a whole number.
+    // xyz: the node's origin relative to the camera chunk's origin, in base
+    // cells, less its apron: always a whole number. w: base cells per cell of
+    // the node (1 at the finest level, doubling with each coarser one).
     @location(2) chunk: vec4<f32>,
 }
 
@@ -43,11 +47,19 @@ fn oct_decode(e: vec2<f32>) -> vec3<f32> {
 @vertex
 fn vs(in: VsIn) -> VsOut {
     var out: VsOut;
-    // Both terms are exact in f32, so a vertex shared by two chunks lands on
+    // Both terms are exact in f32, so a vertex shared by two nodes lands on
     // identical coordinates from either side and seams cannot crack.
-    let cells = vec3<f32>(in.pos.xyz) * (1.0 / 1024.0) + in.chunk.xyz;
+    let cells = vec3<f32>(in.pos.xyz) * (in.chunk.w / 1024.0) + in.chunk.xyz;
     out.world = cells * g.camera.w;
     out.clip = g.view_proj * vec4<f32>(out.world, 1.0);
+    // Coarser nodes overlap the finer ones beside them by a cell. Depth-test
+    // them as if they were a little further away, so the finer mesh wins
+    // wherever both exist and the coarse one only shows through gaps.
+    // (Reverse-Z with an infinite far plane: depth is near / distance.)
+    if (in.chunk.w > 1.0 && out.clip.w > 0.0) {
+        let push = DEPTH_PUSH * in.chunk.w * g.camera.w;
+        out.clip.z = out.clip.z * out.clip.w / (out.clip.w + push);
+    }
     out.normal = oct_decode(in.normal);
     out.color = g.materials[in.pos.w & 3u].rgb;
     return out;

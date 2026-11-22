@@ -2,7 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use glam::{DVec3, IVec3, Vec3};
-use tungsten_core::edit::{EditKind, EditOp, Exclude, FP};
+use tungsten_core::edit::{Exclude, FP, Op};
+use tungsten_core::material::{self, CarveMode};
 use tungsten_core::raycast::{RayHit, raycast};
 use tungsten_core::{Material, WorldParams};
 use tungsten_render::Camera;
@@ -14,9 +15,13 @@ use crate::Args;
 use crate::input::{DoubleTap, Input};
 use crate::player::{Intent, Mode, Player, RADIUS, TICK};
 
-pub const BRUSH_MIN: f32 = 0.5;
+pub const BRUSH_MIN: f32 = 0.25;
 pub const BRUSH_MAX: f32 = 4.0;
 pub const BRUSH_STEP: f32 = 0.25;
+/// Ticks between cuts while mining something that gives way smoothly.
+const CUT_TICKS: u64 = 6;
+/// Metres of mining it takes to break stone, which then goes all at once.
+const STONE_WORK: f32 = 0.75;
 /// How far the player can reach to break or place, metres.
 pub const REACH: f32 = 6.0;
 /// Ticks between autosaves: 30 seconds.
@@ -35,6 +40,9 @@ pub struct Game {
     spawned: bool,
     accumulator: f64,
     space_taps: DoubleTap,
+    /// Ticks the break button has been held, and the mining done on stone since it last broke.
+    mining_ticks: u64,
+    stone_work: f32,
     /// Where the player's state is saved, if the world is persistent.
     player_file: Option<PathBuf>,
     /// Mesh changes not yet handed to the renderer.
@@ -77,6 +85,8 @@ impl Game {
             spawned: false,
             accumulator: 0.0,
             space_taps: DoubleTap::default(),
+            mining_ticks: 0,
+            stone_work: 0.0,
             player_file: args.world.as_ref().map(|d| d.join("player.txt")),
             events: Vec::new(),
         };
@@ -147,7 +157,7 @@ impl Game {
         self.world.params()
     }
 
-    /// Chunk containing a position in metres.
+    /// Finest-level chunk containing a position in metres.
     pub fn chunk_at(&self, pos: DVec3) -> IVec3 {
         (pos / self.params().chunk_metres() as f64).floor().as_ivec3()
     }
@@ -196,8 +206,12 @@ impl Game {
         self.tick += 1;
         let intent = Intent::from_input(input);
         if self.waiting_for_terrain() {
-            // Never simulate against terrain that is not there yet.
-            self.player.tick_idle();
+            // Never walk on or edit terrain that is not there yet. Flying
+            // touches nothing, so it carries on.
+            match self.player.mode {
+                Mode::Fly if self.spawned => self.player.tick_fly(&intent),
+                _ => self.player.tick_idle(),
+            }
             self.aim = None;
             input.place_clicks = 0;
             return;
@@ -213,9 +227,6 @@ impl Game {
             }
         }
         self.edit(input);
-        if self.tick.is_multiple_of(tungsten_core::sand::SAND_INTERVAL) {
-            self.world.step_sand(&mut self.events);
-        }
         if self.tick.is_multiple_of(AUTOSAVE_TICKS) {
             if let Err(e) = self.save(false) {
                 eprintln!("tungsten: {e}");
@@ -239,19 +250,44 @@ impl Game {
         let dir = self.player.view_dir();
         self.aim = raycast(self.world.volume(), eye, dir, REACH / cell as f32);
         let clicks = std::mem::take(&mut input.place_clicks);
+        if !input.break_held {
+            (self.mining_ticks, self.stone_work) = (0, 0.0);
+        }
         let Some(hit) = self.aim else { return };
         let radius = (self.brush_radius as f64 / cell * FP as f64).round() as i64;
 
         if input.break_held {
-            let op = EditOp {
-                kind: EditKind::Break,
-                center: hit.pos.to_array().map(to_fp),
-                radius,
-                material: 0,
-                tick: self.tick,
-                exclude: None,
+            let def = material::def(hit.material);
+            // Where the ball goes: sitting on the surface aimed at, sunk
+            // `depth` metres into it. Measured along the surface normal, so a
+            // glancing aim bites no deeper than a square one.
+            let ball = |depth: f32| {
+                let center = hit.pos + (hit.normal * ((self.brush_radius - depth) / cell as f32)).as_dvec3();
+                center.to_array().map(to_fp)
             };
-            self.world.edit(&op, &mut self.events);
+            let op = match def.carve {
+                // A cut every few ticks, each a little deeper than the last.
+                CarveMode::Smooth => self.mining_ticks.is_multiple_of(CUT_TICKS).then(|| {
+                    let depth = (def.dig_speed * CUT_TICKS as f32 * TICK as f32).min(self.brush_radius);
+                    Op::Break { center: ball(depth), radius, nearest: false }
+                }),
+                // Stone holds until enough work is done, then the shard aimed
+                // at breaks off with every other the ball has reached.
+                CarveMode::Shards => {
+                    self.stone_work += def.dig_speed * TICK as f32;
+                    (self.stone_work >= STONE_WORK).then(|| {
+                        self.stone_work = 0.0;
+                        // Centred just inside the surface, so the shard it is
+                        // in is the one being looked at.
+                        let center = hit.pos - (hit.normal * (self.brush_radius.min(0.4) / cell as f32)).as_dvec3();
+                        Op::Break { center: center.to_array().map(to_fp), radius, nearest: true }
+                    })
+                }
+            };
+            self.mining_ticks += 1;
+            if let Some(op) = op {
+                self.world.edit(&op);
+            }
         }
         if clicks > 0 {
             // Centre the stamp just outside the surface so it attaches to it.
@@ -259,12 +295,10 @@ impl Game {
             let feet = self.player.pos / cell;
             // The surface forms about half a cell outside the last full sample.
             let margin = 1.0;
-            let op = EditOp {
-                kind: EditKind::Place,
+            let op = Op::Place {
                 center: center.to_array().map(to_fp),
                 radius,
                 material: self.selected as u8,
-                tick: self.tick,
                 exclude: (self.player.mode == Mode::Walk).then(|| Exclude {
                     x: to_fp(feet.x),
                     z: to_fp(feet.z),
@@ -273,14 +307,13 @@ impl Game {
                     radius: to_fp(RADIUS as f64 / cell + margin),
                 }),
             };
-            self.world.edit(&op, &mut self.events);
+            self.world.edit(&op);
         }
     }
 
-    /// Advance chunk streaming around the player.
+    /// Advance streaming around the player.
     pub fn stream(&mut self) {
-        let focus = self.chunk_at(self.player.pos);
-        self.world.update(focus, &mut self.events);
+        self.world.update(self.player.pos, &mut self.events);
     }
 
     /// Fraction of a tick elapsed since the last one, for interpolation.
@@ -303,6 +336,6 @@ impl Game {
 
     /// Distance in metres at which terrain stops being drawn.
     pub fn view_distance(&self) -> f32 {
-        self.world.config().radius_h as f32 * self.params().chunk_metres()
+        self.world.config().view_distance
     }
 }

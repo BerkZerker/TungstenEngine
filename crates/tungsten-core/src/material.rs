@@ -13,8 +13,8 @@ pub const MATERIAL_COUNT: usize = 4;
 /// How a material gives way under the mining brush.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CarveMode {
-    /// Fill is worn away smoothly under the brush.
-    Erode,
+    /// Cut away smoothly to the shape of the brush.
+    Smooth,
     /// Breaks off in world-anchored angular shards.
     Shards,
 }
@@ -26,53 +26,24 @@ pub struct MaterialDef {
     /// 0 meshes rounded and shades smooth, 1 meshes crisp and shades faceted.
     pub sharpness: f32,
     pub carve: CarveMode,
-    /// Fill removed per tick at the brush centre, in 1/256 fill units.
-    pub carve_rate: u32,
-    /// Settles to its angle of repose after edits.
-    pub slumps: bool,
+    /// How fast the brush sinks into it while mining, metres per second.
+    pub dig_speed: f32,
 }
 
-/// Simulation ticks per second; carve rates are derived from it.
+/// Simulation ticks per second.
 pub const TICK_HZ: u32 = 60;
 
-/// Rate that takes a full sample to the surface threshold in `seconds`.
-const fn rate_for(seconds_x100: u32) -> u32 {
-    128 * 256 * 100 / (seconds_x100 * TICK_HZ)
-}
-
 pub const MATERIALS: [MaterialDef; MATERIAL_COUNT] = [
-    MaterialDef {
-        name: "air",
-        color: [0.0, 0.0, 0.0],
-        sharpness: 0.0,
-        carve: CarveMode::Erode,
-        carve_rate: 0,
-        slumps: false,
-    },
-    MaterialDef {
-        name: "stone",
-        color: [0.17, 0.18, 0.20],
-        sharpness: 1.0,
-        carve: CarveMode::Shards,
-        carve_rate: rate_for(120),
-        slumps: false,
-    },
+    MaterialDef { name: "air", color: [0.0, 0.0, 0.0], sharpness: 0.0, carve: CarveMode::Smooth, dig_speed: 0.0 },
+    MaterialDef { name: "stone", color: [0.17, 0.18, 0.20], sharpness: 1.0, carve: CarveMode::Shards, dig_speed: 1.0 },
     MaterialDef {
         name: "dirt",
         color: [0.135, 0.075, 0.036],
         sharpness: 0.0,
-        carve: CarveMode::Erode,
-        carve_rate: rate_for(40),
-        slumps: false,
+        carve: CarveMode::Smooth,
+        dig_speed: 2.5,
     },
-    MaterialDef {
-        name: "sand",
-        color: [0.66, 0.53, 0.25],
-        sharpness: 0.0,
-        carve: CarveMode::Erode,
-        carve_rate: rate_for(15),
-        slumps: true,
-    },
+    MaterialDef { name: "sand", color: [0.66, 0.53, 0.25], sharpness: 0.0, carve: CarveMode::Smooth, dig_speed: 5.0 },
 ];
 
 impl Material {

@@ -27,9 +27,9 @@ pub fn run(args: Args) -> Result<(), String> {
     game.player.mode = Mode::Fly;
     let config = game.world.config();
     println!(
-        "bench: radius {}x{} chunks, {} workers, cell {} m",
-        config.radius_h,
-        config.radius_v,
+        "bench: view {} m, detail {}, {} workers, cell {} m",
+        config.view_distance,
+        config.detail,
         config.workers,
         game.params().cell_size
     );
@@ -45,13 +45,13 @@ pub fn run(args: Args) -> Result<(), String> {
     let cold = start.elapsed().as_secs_f64();
     let stats = game.world.stats();
     println!(
-        "cold load: {} chunks ({} dense), {} meshes, {:.2}M triangles in {:.3} s = {:.0} chunks/s",
-        stats.loaded,
-        stats.dense,
+        "cold load: {} nodes, {} meshes, {:.2}M triangles in {:.3} s = {:.0} nodes/s; drawn by level {:?}",
+        stats.nodes,
         uploads,
         triangles as f64 / 1e6,
         cold,
-        stats.loaded as f64 / cold
+        stats.nodes as f64 / cold,
+        stats.drawn
     );
 
     // Fly forward at fly-run speed, paced to real time like the game loop.
@@ -73,7 +73,7 @@ pub fn run(args: Args) -> Result<(), String> {
         total += spent;
         count(&mut game.events, &mut uploads, &mut triangles);
         let s = game.world.stats();
-        let backlog = s.loading + s.awaiting_mesh + s.jobs_queued;
+        let backlog = s.jobs_queued + s.jobs_running;
         backlog_max = backlog_max.max(backlog);
         backlog_sum += backlog;
         waiting += game.waiting_for_terrain() as u64;
@@ -96,7 +96,7 @@ pub fn run(args: Args) -> Result<(), String> {
         worst.as_secs_f64() * 1000.0
     );
     println!(
-        "backlog (chunks loading or awaiting mesh): {:.0} average, {} worst; ticks spent waiting for terrain: {}",
+        "backlog (node jobs queued or running): {:.0} average, {} worst; ticks spent waiting for terrain: {}",
         backlog_sum as f64 / ticks.max(1) as f64,
         backlog_max,
         waiting

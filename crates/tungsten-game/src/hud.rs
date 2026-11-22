@@ -134,16 +134,18 @@ pub fn build(text: &mut TextBatch, info: &HudInfo) {
         let _ = writeln!(out, "waiting for terrain");
     }
     let _ = writeln!(out);
+    let d = stats.drawn;
     let _ = writeln!(
         out,
-        "chunks  {} loaded ({} dense)  {} loading  {} meshed",
-        stats.loaded, stats.dense, stats.loading, stats.meshed
+        "nodes   {} ({} meshed)  drawn by level {} {} {} {} {} {}",
+        stats.nodes, stats.meshed, d[0], d[1], d[2], d[3], d[4], d[5]
     );
     let _ = writeln!(
         out,
-        "jobs    {} queued  {} running  {} awaiting mesh",
-        stats.jobs_queued, stats.jobs_running, stats.awaiting_mesh
+        "near    {} chunks ({} dense)  jobs {} queued {} running",
+        stats.chunks, stats.dense, stats.jobs_queued, stats.jobs_running
     );
+    let _ = writeln!(out, "edits   {} ops in {} cells  {} baked", stats.ops, stats.cells, stats.bakes);
     let _ = writeln!(
         out,
         "draw    {} calls  {:.0}k tris  gpu {:.0}/{:.0} MB",
@@ -154,12 +156,12 @@ pub fn build(text: &mut TextBatch, info: &HudInfo) {
     );
     let _ = writeln!(
         out,
-        "world   seed {}  cell {} m  fragment {} m  tick {}  sand awake {}",
+        "world   seed {}  cell {} m  fragment {} m  view {} m  tick {}",
         params.seed,
         params.cell_size,
         params.min_fragment,
-        g.tick,
-        g.world.sand_awake()
+        g.view_distance(),
+        g.tick
     );
     let _ = write!(out, "{}", info.gpu);
     text.push(6.0 * s, 6.0 * s, s, WHITE, &out);

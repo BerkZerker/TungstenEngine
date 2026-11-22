@@ -103,8 +103,6 @@ impl Chunk {
 #[derive(Default)]
 pub struct Volume {
     pub chunks: IntMap<ChunkPos, Arc<Chunk>>,
-    /// Which samples of each chunk have been written by edits.
-    pub touched: IntMap<ChunkPos, crate::field::Touched>,
 }
 
 impl Volume {
@@ -142,8 +140,6 @@ impl Volume {
                     let d = Arc::make_mut(c).dense_mut();
                     d.fill[i] = s.fill;
                     d.mat[i] = s.mat;
-                    let t = self.touched.entry(chunk_of(p)).or_insert_with(|| Box::new([0; CHUNK_VOLUME / 64]));
-                    t[i / 64] |= 1 << (i % 64);
                 }
                 true
             }

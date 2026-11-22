@@ -1,8 +1,8 @@
 use bytemuck::{Pod, Zeroable};
 use glam::{IVec3, Mat4, Vec3, Vec4};
-use tungsten_core::CHUNK_SIZE;
-use tungsten_core::hash::IntMap;
+use tungsten_core::hash::{IntMap, IntSet};
 use tungsten_core::mesh::{APRON, ChunkMesh, MeshVertex};
+use tungsten_core::{CHUNK_SIZE, NodeKey};
 
 use crate::arena::{Alloc, Arena};
 
@@ -45,7 +45,9 @@ pub(crate) struct Terrain {
     instance_capacity: usize,
     vertex_arena: Arena,
     index_arena: Arena,
-    chunks: IntMap<IVec3, ChunkGpu>,
+    chunks: IntMap<NodeKey, ChunkGpu>,
+    /// Nodes that are to be drawn, whether or not they have a mesh.
+    shown: IntSet<NodeKey>,
     visible: Vec<Visible>,
     origins: Vec<[f32; 4]>,
 }
@@ -157,6 +159,7 @@ impl Terrain {
             ),
             index_arena: Arena::new("terrain indices", wgpu::BufferUsages::INDEX, 4, 1 << 21),
             chunks: IntMap::default(),
+            shown: IntSet::default(),
             visible: Vec::new(),
             origins: Vec::new(),
         }
@@ -182,8 +185,8 @@ impl Terrain {
         )
     }
 
-    pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, pos: IVec3, mesh: &ChunkMesh) {
-        self.remove(pos);
+    pub fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, key: NodeKey, mesh: &ChunkMesh) {
+        self.remove(key);
         if mesh.is_empty() {
             return;
         }
@@ -192,17 +195,25 @@ impl Terrain {
         let indices = self.index_arena.alloc(device, (mesh.indices.len() / 2) as u32);
         self.vertex_arena.write(queue, vertices, bytemuck::cast_slice(&mesh.vertices));
         self.index_arena.write(queue, indices, bytemuck::cast_slice(&mesh.indices));
-        self.chunks.insert(pos, ChunkGpu { vertices, indices, index_count: mesh.indices.len() as u32 });
+        self.chunks.insert(key, ChunkGpu { vertices, indices, index_count: mesh.indices.len() as u32 });
     }
 
-    pub fn remove(&mut self, pos: IVec3) {
-        if let Some(c) = self.chunks.remove(&pos) {
+    pub fn remove(&mut self, key: NodeKey) {
+        if let Some(c) = self.chunks.remove(&key) {
             self.vertex_arena.free(c.vertices);
             self.index_arena.free(c.indices);
         }
     }
 
-    /// Cull, sort front to back and upload per-chunk origins. Returns (draws, triangles).
+    /// Change which nodes are drawn.
+    pub fn set_visible(&mut self, show: &[NodeKey], hide: &[NodeKey]) {
+        for key in hide {
+            self.shown.remove(key);
+        }
+        self.shown.extend(show.iter().copied());
+    }
+
+    /// Cull, sort front to back and upload per-node origins. Returns (draws, triangles).
     #[allow(clippy::too_many_arguments)]
     pub fn prepare(
         &mut self,
@@ -212,18 +223,24 @@ impl Terrain {
         view_proj: &Mat4,
         camera_chunk: IVec3,
         camera_local: Vec3,
-        chunk_metres: f32,
         cell_size: f32,
     ) -> (u32, u32) {
         queue.write_buffer(&self.globals, 0, bytemuck::bytes_of(globals));
         let planes = frustum_planes(view_proj);
         self.visible.clear();
         let mut triangles = 0;
-        for (&pos, c) in &self.chunks {
-            let cells = ((pos - camera_chunk) * CHUNK_SIZE - APRON).as_vec3();
-            let origin = (pos - camera_chunk).as_vec3() * chunk_metres;
-            // Meshes reach one cell below the chunk's own cells.
-            let (min, max) = (origin - cell_size, origin + chunk_metres);
+        for (key, c) in &self.chunks {
+            if !self.shown.contains(key) {
+                continue;
+            }
+            // In base cells from the camera chunk's origin: whole numbers, exact in f32.
+            let step = key.step();
+            let base = key.origin() - camera_chunk * CHUNK_SIZE;
+            let cells = (base - APRON * step).as_vec3();
+            let spacing = cell_size * step as f32;
+            let origin = base.as_vec3() * cell_size;
+            // Meshes reach up to two cells beyond the chunk's own.
+            let (min, max) = (origin - 2.0 * spacing, origin + (CHUNK_SIZE + 2) as f32 * spacing);
             if !aabb_visible(&planes, min, max) {
                 continue;
             }
@@ -235,7 +252,7 @@ impl Terrain {
                 first_index: c.indices.offset * 2,
                 index_count: c.index_count,
                 base_vertex: c.vertices.offset as i32,
-                origin: [cells.x, cells.y, cells.z, 0.0],
+                origin: [cells.x, cells.y, cells.z, step as f32],
             });
         }
         self.visible.sort_unstable_by(|a, b| a.distance.total_cmp(&b.distance));

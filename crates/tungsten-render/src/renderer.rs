@@ -1,7 +1,7 @@
 use glam::{IVec3, Vec3};
-use tungsten_core::WorldParams;
 use tungsten_core::material::MATERIALS;
 use tungsten_core::mesh::ChunkMesh;
+use tungsten_core::{NodeKey, WorldParams};
 
 use crate::gpu::Gpu;
 use crate::lines::{LineBatch, LinePipeline};
@@ -12,8 +12,9 @@ pub(crate) const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth3
 const SAMPLES: u32 = 4;
 const Z_NEAR: f32 = 0.08;
 
-/// Where the frame is seen from. Position is split into a chunk and an offset
-/// inside it so rendering stays precise at any distance from the origin.
+/// Where the frame is seen from. Position is split into a finest-level chunk
+/// and an offset inside it so rendering stays precise at any distance from
+/// the origin.
 #[derive(Clone, Copy, Debug)]
 pub struct Camera {
     pub chunk: IVec3,
@@ -124,12 +125,17 @@ impl Renderer {
         }
     }
 
-    pub fn upload_chunk(&mut self, gpu: &Gpu, pos: IVec3, mesh: &ChunkMesh) {
-        self.terrain.upload(&gpu.device, &gpu.queue, pos, mesh);
+    pub fn upload_node(&mut self, gpu: &Gpu, key: NodeKey, mesh: &ChunkMesh) {
+        self.terrain.upload(&gpu.device, &gpu.queue, key, mesh);
     }
 
-    pub fn remove_chunk(&mut self, pos: IVec3) {
-        self.terrain.remove(pos);
+    pub fn remove_node(&mut self, key: NodeKey) {
+        self.terrain.remove(key);
+    }
+
+    /// Change which nodes are drawn. A node is hidden until shown.
+    pub fn set_visible(&mut self, show: &[NodeKey], hide: &[NodeKey]) {
+        self.terrain.set_visible(show, hide);
     }
 
     /// Draw one frame into `target`, which must have this renderer's format and size.
@@ -169,7 +175,6 @@ impl Renderer {
             &view_proj,
             camera.chunk,
             camera.local,
-            self.params.chunk_metres(),
             self.params.cell_size,
         );
         let line_vertices = self.lines.prepare(&gpu.device, &gpu.queue, &view_proj, lines);

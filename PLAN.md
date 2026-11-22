@@ -1,10 +1,101 @@
-# Tungsten Engine v0.1 Plan
+# Tungsten Engine Plan
 
-Companion to `SPEC.md`. Sections 1 to 3 record what is decided, sections 4 to 10 map out
-how the mechanics work, section 11 is the build order, and section 12 lists what still
-needs your sign-off.
+Companion to `SPEC.md`. The first section describes the engine as it is now (v0.2).
+Sections 0 to 12 are the v0.1 plan, kept for the mechanics that have not changed
+(materials, meshing rules, the player, rendering, the determinism boundary). Where
+they disagree with the v0.2 section, v0.2 is what is built: in particular 4.1 (cell
+size), 4.2 and 9.3 (chunks and their lifecycle), 7.2 and 7.3 (how brushes are
+applied), 7.5 (sand slump, removed) and 9.6 (saves).
 
-## 0. Status (2026-11-21)
+## v0.2: function terrain and LOD (2026-11-21)
+
+Decided with the user: the world is a function (generator plus a log of edit
+operations), drawn at 0.25 m next to the player and out to 2 km at lower detail.
+Sand is static for now and becomes a pile function with the water phase, which is
+next. Old worlds are not kept readable.
+
+### How it works
+
+- **Truth.** Seed plus an edit log. An edit is a shape (`Op`): `Break` (sphere;
+  stone gives way in whole shards whose centre is inside it), `Place` (sphere
+  of a material, never repainting solid, leaving the player's capsule out) and
+  `Clear` (lattice points of a fragment that broke off). Positions are
+  fixed-point, 1/256 of the base cell.
+- **Levels.** Level L samples every `cell_size * 2^L`; six levels, 0.25 m to
+  8 m. A node is a 32-cell chunk of one level. An op is a pure per-sample
+  min/max with a function of position, and whether a sample ends up solid
+  depends only on the sign of its distance to the shape, so a lattice point
+  shared by several levels is solid, and of the same material, in all of them.
+- **Log.** Ops are filed in edit cells, each op in every cell it can reach. A
+  sample is resolved from its own cell only: generator, then the cell's baked
+  overlay, then its ops in order. There are two tiers of cells: 32 m cells for
+  levels 0 to 2 and 256 m cells for levels 3 to 5. An op reaches two cells of
+  a level beyond its shape, so one tier of 32 m cells put every edit in 27 of
+  them.
+- **Baking.** A cell with 512 ops is resolved on a worker at each level its
+  tier serves and stored as a run-length overlay on the generator; the ops
+  are dropped. The samples are identical by construction (tested), so nothing
+  is remeshed.
+- **Streaming.** An octree by distance. Roots are level-5 nodes within the
+  view distance; a node splits while the player is within two node lengths of
+  it (`--detail`). Every node job is stateless: generate the padded block,
+  resolve the log, mesh. Level-0 jobs also return the chunk, which goes into
+  `Volume` for collision, raycasts and editing. An edit changes `Volume` in
+  place and remeshes the level-0 chunks from it within the tick; coarser
+  nodes re-resolve on workers.
+- **Seams.** Coarser nodes mesh one cell beyond their bounds and are pushed
+  back in depth by two of their cells, so the finer mesh wins wherever both
+  exist. A parent stays on screen until all eight children are ready, and
+  children until the parent is; each such swap reaches the renderer as one
+  event.
+- **Generator** (version 3). Same terrain as v0.1 at every level. Caves are
+  generated at levels 0 to 3 only. Where the dirt or sand cover is thinner
+  than a coarse cell, the cover material still wins, so bedrock does not show
+  through at a distance.
+- **Mining.** Dirt and sand: every 6 ticks a ball is cut, sunk 0.1 s of the
+  material's dig speed (dirt 2.5 m/s, sand 5 m/s) into the surface along its
+  normal. Stone: after 0.75 m of work at 1 m/s the shard under the crosshair
+  breaks off with every other shard whose centre is in the brush. The brush
+  goes down to 0.25 m.
+- **Saves.** Region files of 16^3 edit cells per tier, each cell its ops plus
+  baked overlay. World format 2.
+
+### Status
+
+**Verified by running it**
+
+- 45 tests pass; clippy is clean with warnings as errors.
+- Golden hashes (generated blocks at all six levels near and 500 km from the
+  origin, a 120-op editing session, the same session resolved from the log at
+  every level, and the encoded log before and after baking) are identical on
+  ARM64 and on x86-64 (under Rosetta), at 1 and 7 threads. The same test
+  checks that the log reproduces the edited volume exactly and that baking
+  changes no sample.
+- Benchmark at the defaults (2048 m, 0.25 m cells, 10 workers): cold load of
+  3,400 nodes, 1,683 meshes and 4.0M triangles in 0.18 s. Flying at 60 m/s:
+  0.31 ms of main-thread time per tick on average, 1.0 ms worst, and no tick
+  spent waiting for terrain.
+- The window on Metal at 3024 x 1800: about 1,200 fps standing still, worst
+  frame 5 ms; 0.9 to 1.2M triangles in 400 to 500 draws.
+- Headless captures: terrain continuous to 2 km with no visible seams from
+  the ground; digging, placing sand and stone; the same edits after a reload
+  and seen from 40 m at a coarser level.
+
+**Not verified**
+
+- How it feels in the hand. I can only drive it with scripted input.
+- Vulkan and DX12. Only Metal has run.
+- Baking in a long play session (covered by tests only).
+
+**Known limits**
+
+- Material boundaries are blocky far away: they are hard edges on 4 to 8 m cells.
+- Cave mouths close beyond about 250 m, where level 4 takes over.
+- Collision and raycasts use level-0 samples, loaded within about 16 m of the
+  player; flying faster than terrain loads is allowed, walking waits for it.
+- Sand does not move.
+
+## 0. v0.1 status (2026-11-21, historical)
 
 Milestones 0 to 6 are implemented and most of 7. `README.md` has the controls and
 commands.
