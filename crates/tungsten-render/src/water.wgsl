@@ -20,8 +20,6 @@ struct Globals {
 // Distance to the terrain already drawn, to tell how much water is in front of it.
 @group(0) @binding(1) var terrain_distance: texture_multisampled_2d<f32>;
 
-// Must match terrain.wgsl: water is hidden by the terrain of its own node.
-const DEPTH_PUSH: f32 = 2.0;
 // The ripple pattern repeats every this many metres, so it can be placed
 // from a position kept small enough to stay precise.
 const PERIOD: f32 = 64.0;
@@ -47,11 +45,11 @@ fn vs(
     var out: VsOut;
     let cells = vec3<f32>(f32(pos.x) * node.w + node.x, node.y, f32(pos.y) * node.w + node.z);
     out.world = cells * g.camera.w;
+    // Not pushed back in depth like its node's terrain: the ground under it
+    // can be a finer node's, pushed back less, which would hide shallow
+    // water along the seam. Terrain that is in front of it is told by the
+    // distance attachment instead.
     out.clip = g.view_proj * vec4<f32>(out.world, 1.0);
-    if (node.w > 1.0 && out.clip.w > 0.0) {
-        let push = DEPTH_PUSH * node.w * g.camera.w;
-        out.clip.z = out.clip.z * out.clip.w / (out.clip.w + push);
-    }
     return out;
 }
 
@@ -83,16 +81,16 @@ fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let slope = ripple(in.world.xz + g.water.xy, g.water.z) / (1.0 + dist * dist / 22500.0);
     var n = normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
     let fog = smoothstep(g.fog.x, g.fog.y, dist);
+    // Metres of water looked through before the ground behind it.
+    let ground = textureLoad(terrain_distance, vec2<i32>(in.clip.xy), 0).r;
+    let through = max(ground - dist, 0.0);
 
     if (v.y < 0.0) {
         // Seen from below: a bright, mostly clear ceiling.
         let glow = mix(DEEP * 4.0, g.fog_color.rgb, 0.6 * max(dot(-n, v), 0.0));
-        return vec4<f32>(mix(glow, g.fog_color.rgb, fog), 0.55);
+        return vec4<f32>(mix(glow, g.fog_color.rgb, fog), select(0.0, 0.55, through > 0.0));
     }
 
-    // Metres of water looked through before the ground behind it.
-    let ground = textureLoad(terrain_distance, vec2<i32>(in.clip.xy), 0).r;
-    let through = max(ground - dist, 0.0);
     // The thinnest water at a shore is not drawn: the surface is flat and
     // the lattice it was worked out on is not, so its edge is only near.
     let shore = smoothstep(0.0, 0.08, through * v.y);
